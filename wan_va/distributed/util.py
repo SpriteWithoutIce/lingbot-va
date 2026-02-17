@@ -3,11 +3,12 @@ import torch
 import torch.distributed as dist
 
 
-def _configure_model(model, shard_fn, param_dtype, device):
+def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     """
     TODO
     """
-    model.eval().requires_grad_(False)
+    if eval_mode:
+        model.eval().requires_grad_(False)
     if dist.is_initialized():
         dist.barrier()
 
@@ -27,3 +28,13 @@ def init_distributed(world_size, local_rank, rank):
                             init_method="env://",
                             rank=rank,
                             world_size=world_size)
+
+def dist_mean(local_tensor):
+    if dist.is_initialized():
+        dist.all_reduce(local_tensor, op=dist.ReduceOp.AVG)
+    return local_tensor
+
+def dist_max(local_tensor):
+    if dist.is_initialized():
+        dist.all_reduce(local_tensor, op=dist.ReduceOp.MAX)
+    return local_tensor

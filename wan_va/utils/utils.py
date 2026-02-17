@@ -73,3 +73,20 @@ def save_async(obj, file_path):
         executor.submit(np.save, file_path, obj_copy)
     else:
         executor.submit(torch.save, obj, file_path)
+
+def sample_timestep_id(
+    batch_size: int = 1,
+    min_timestep_bd: float = 0.0,
+    max_timestep_bd: float = 1.0,
+    num_train_timesteps: int = 1000,
+):
+    u = torch.rand(size=[batch_size])
+    u = u * (max_timestep_bd - min_timestep_bd) + min_timestep_bd
+    timestep_id = (u * num_train_timesteps).clamp(min=0, max=num_train_timesteps - 1).to(torch.int64)
+    return timestep_id
+
+
+def warmup_constant_lambda(current_step, warmup_steps=1000):
+    if current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+    return 1.0

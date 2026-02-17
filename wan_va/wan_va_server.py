@@ -82,11 +82,13 @@ class VA_Server:
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
-        shard_fn = partial(shard_model, device_id=job_config.local_rank)
+        shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
-                                            device=self.device)
+                                            device=self.device,
+                                            eval_mode=True,
+                                            )
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -476,7 +478,6 @@ class VA_Server:
             value=0)
 
         with (
-                torch.amp.autocast('cuda', dtype=self.dtype),
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
@@ -583,7 +584,6 @@ class VA_Server:
                                                 frame_st_id=self.frame_st_id)
 
         with (
-                torch.amp.autocast('cuda', dtype=self.dtype),
                 torch.no_grad(),
         ):
             self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
