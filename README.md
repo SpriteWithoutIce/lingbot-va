@@ -208,6 +208,83 @@ Download the post-training dataset from HuggingFace:
 huggingface-cli download --repo-type dataset robbyant/robotwin-clean-and-aug-lerobot --local-dir /path/to/your/dataset
 ```
 
+### Custom Dataset Preparation
+
+If you want to fine-tune LingBot-VA on your own robotic manipulation data, follow these three steps:
+
+**Step 1: Convert your data to LeRobot format**
+
+Follow the official [LeRobot dataset documentation](https://github.com/huggingface/lerobot/tree/v0.3.3) to convert your raw data (e.g., HDF5, video files, etc.) into the standard LeRobot dataset format. Ensure that each episode contains the required observation videos, actions, and metadata.
+
+**Step 2: Add `action_config` field to `episodes.jsonl`**
+
+After converting to LeRobot format, you need to modify the `meta/episodes.jsonl` file to add an `action_config` field to each line. This field describes the temporal segmentation and natural language description of the robot's actions within each episode.
+
+Each line in `episodes.jsonl` should follow this format:
+
+```json
+{
+  "episode_index": 0,
+  "tasks": ["task description"],
+  "length": 450,
+  "action_config": [
+    {
+      "start_frame": 0,
+      "end_frame": 450,
+      "action_text": "Natural language description of the robot action in this segment.",
+    }
+  ]
+}
+```
+
+- `start_frame` / `end_frame`: The frame range (0-indexed) of the action segment within the episode.
+- `action_text`: A natural language description of what the robot does in this segment.
+
+For episodes with a single continuous action, `start_frame` should be `0` and `end_frame` should equal the episode `length`. You can also define multiple segments per episode if your data contains sequential sub-tasks.
+
+**Step 3: Extract video latents with Wan2.2 VAE**
+
+LingBot-VA operates on video latent representations rather than raw pixels. You need to extract the latent features using the Wan2.2 VAE encoder and place them under the converted LeRobot dataset directory. Please refer to the [Wan-Video documentation](https://github.com/Wan-Video) for instructions on how to run the VAE encoder.
+
+The extracted latent files should be placed under `latents/` in your dataset directory, mirroring the structure of `videos/`:
+
+```
+your_dataset/
+├── videos/
+│   └── chunk-000/
+│       └── observation.images.cam_high/
+│           ├── episode_000000.mp4
+│           └── ...
+├── latents/
+│   └── chunk-000/
+│       └── observation.images.cam_high/
+│           ├── episode_000000_0_450.pth    # named as episode_{index}_{start_frame}_{end_frame}.pth
+│           └── ...
+└── meta/
+    └── episodes.jsonl
+```
+
+Each `.pth` file is a dictionary containing the following fields:
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `latent` | `Tensor [N, C]` (bfloat16) | Flattened VAE latent features (e.g., shape `[latent_num_frames * latent_height * latent_width, C]`) |
+| `latent_num_frames` | `int` | Number of temporal frames in the latent space |
+| `latent_height` | `int` | Spatial height in the latent space |
+| `latent_width` | `int` | Spatial width in the latent space |
+| `video_num_frames` | `int` | Number of frames in the (sampled) source video |
+| `video_height` | `int` | Original video height in pixels |
+| `video_width` | `int` | Original video width in pixels |
+| `text_emb` | `Tensor [L, D]` (bfloat16) | Text embedding of the action description (encoded by Wan2.2 text encoder) |
+| `text` | `str` | The raw action description text |
+| `frame_ids` | `list[int]` | Sampled frame indices from the original episode (at target fps) |
+| `start_frame` | `int` | Start frame index matching `action_config` in `episodes.jsonl` |
+| `end_frame` | `int` | End frame index matching `action_config` in `episodes.jsonl` |
+| `fps` | `int` | Target sampling fps used for latent extraction |
+| `ori_fps` | `int` | Original fps of the episode data |
+
+The latent file naming convention `episode_{index}_{start_frame}_{end_frame}.pth` corresponds to the `action_config` segments defined in `episodes.jsonl`. For example, an episode with `"start_frame": 0, "end_frame": 450` produces a latent file named `episode_000000_0_450.pth`.
+
 ### Training
 
 ```bash
