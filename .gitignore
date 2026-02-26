@@ -4,3 +4,5 @@ data/
 train_out/
 assets/
 example/
+*.pdf
+server_out/

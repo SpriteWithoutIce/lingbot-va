@@ -376,7 +376,7 @@ class VA_Server:
                 videos_high.to(vae_device).to(self.dtype))
             enc_out_wrist = self.streaming_vae_half.encode_chunk(
                 videos_wrist.to(vae_device).to(self.dtype))
-            enc_out = torch.cat([enc_out_high, enc_out_wrist], dim=-2)
+            enc_out = torch.cat([enc_out_wrist, enc_out_high], dim=-2)
         else:
             videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
             videos_chunk = videos.to(self.device).to(self.dtype)

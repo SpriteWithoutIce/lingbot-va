@@ -388,8 +388,8 @@ class LatentLeRobotDataset(LeRobotDataset):
 
         action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids]
         action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
-        # action_aligned = (action_aligned - self.q01) / (
-        #         self.q99 - self.q01 + 1e-6) * 2. - 1.
+        action_aligned = (action_aligned - self.q01) / (
+                self.q99 - self.q01 + 1e-6) * 2. - 1.
         action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_aligned *= action_mask_aligned

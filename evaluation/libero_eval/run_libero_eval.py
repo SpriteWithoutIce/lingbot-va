@@ -62,7 +62,12 @@ def _get_libero_env(task, resolution: int, seed: int):
     return env, task_description
 
 
-def _server_action_to_env_actions(raw_action: np.ndarray, replan_steps: int):
+def _server_action_to_env_actions(
+    raw_action: np.ndarray,
+    replan_steps: int,
+    *,
+    skip_first_frame: bool = False,
+):
     """
     Convert server action output to a list of 7-dim LIBERO env actions.
 
@@ -76,7 +81,12 @@ def _server_action_to_env_actions(raw_action: np.ndarray, replan_steps: int):
     c, f, h = raw_action.shape                  # (7, frame_chunk, action_per_frame)
     steps = raw_action.reshape(c, -1).T         # (total_steps, 7)
 
-    env_actions = list(steps)                   # each element: (7,) already in original scale
+    if skip_first_frame:
+        # Match server-side conditioning at frame_st_id == 0:
+        # first latent-frame actions are fixed to action_cond (zeros) and should not be executed.
+        env_actions = list(steps[h:])
+    else:
+        env_actions = list(steps) 
 
     if replan_steps is not None:
         env_actions = env_actions[:replan_steps]
@@ -147,6 +157,7 @@ def eval_libero(cfg: Args) -> None:
             t = 0
             replay_images = []
             done = False
+            is_first_chunk = True
 
             # Reset server for new episode (set prompt)
             client.infer({"reset": True, "prompt": task_description})
@@ -207,11 +218,13 @@ def eval_libero(cfg: Args) -> None:
                         last_raw_action = raw_action
                         # reset: collect video-rate frames for the next kv_cache call
                         key_frame_list = []
-                        action_step_in_chunk = 0
                         chunk = _server_action_to_env_actions(
-                            raw_action, cfg.replan_steps
+                            raw_action,
+                            cfg.replan_steps,
+                            skip_first_frame=is_first_chunk,
                         )
                         action_plan.extend(chunk)
+                        is_first_chunk = False
 
                     action = list(action_plan.popleft())
                     obs, reward, done, info = env.step(action)
