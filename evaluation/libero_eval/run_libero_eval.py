@@ -77,6 +77,10 @@ def _server_action_to_env_actions(
     Channel layout: [dx, dy, dz, daa1, daa2, daa3, gripper].
 
     LIBERO env expects [dx, dy, dz, daa1, daa2, daa3, gripper].
+
+    Returns:
+        env_actions: list[np.ndarray] at control frequency.
+        steps_per_latent_frame: action_per_frame from server output.
     """
     c, f, h = raw_action.shape                  # (7, frame_chunk, action_per_frame)
     steps = raw_action.reshape(c, -1).T         # (total_steps, 7)
@@ -86,11 +90,16 @@ def _server_action_to_env_actions(
         # first latent-frame actions are fixed to action_cond (zeros) and should not be executed.
         env_actions = list(steps[h:])
     else:
-        env_actions = list(steps) 
+        env_actions = list(steps)
 
     if replan_steps is not None:
         env_actions = env_actions[:replan_steps]
-    return env_actions
+
+    # KV-cache updates consume observations at latent-video rate (1 frame per h actions).
+    # Ensure we only execute full latent-frame windows to avoid obs/state length mismatch.
+    full_windows = len(env_actions) // h
+    env_actions = env_actions[: full_windows * h]
+    return env_actions, h
 
 @dataclasses.dataclass
 class Args:
@@ -149,9 +158,10 @@ def eval_libero(cfg: Args) -> None:
         ):
             env.reset()
             action_plan = collections.deque()
-            last_raw_action = None
+            last_state_for_kv = None
             key_frame_list = []        # frames at VIDEO rate (one per action_per_frame steps)
             action_step_in_chunk = 0  # counts action steps within current chunk
+            current_action_per_frame = cfg.action_per_frame
 
             obs = env.set_init_state(initial_states[episode_idx])
             t = 0
@@ -193,14 +203,14 @@ def eval_libero(cfg: Args) -> None:
 
                     if not action_plan:
                         if (
-                            last_raw_action is not None
+                            last_state_for_kv is not None
                             and len(key_frame_list) > 0
                         ):
                             client.infer(
                                 {
                                     "obs": key_frame_list,
                                     "compute_kv_cache": True,
-                                    "state": last_raw_action,
+                                    "state": last_state_for_kv,
                                     "prompt": task_description,
                                 }
                             )
@@ -215,15 +225,39 @@ def eval_libero(cfg: Args) -> None:
                         }
                         resp = client.infer(obs_dict)
                         raw_action = resp["action"]
-                        last_raw_action = raw_action
                         # reset: collect video-rate frames for the next kv_cache call
                         key_frame_list = []
-                        chunk = _server_action_to_env_actions(
+                        chunk, action_per_frame = _server_action_to_env_actions(
                             raw_action,
                             cfg.replan_steps,
                             skip_first_frame=is_first_chunk,
                         )
                         action_plan.extend(chunk)
+                        current_action_per_frame = action_per_frame
+
+                        # Build the action tensor used by compute_kv_cache from ACTUALLY
+                        # executed steps, and keep its latent-frame grouping aligned
+                        # with video-rate keyframes.
+                        raw_steps = raw_action.reshape(raw_action.shape[0], -1).T
+                        executed_steps = np.asarray(chunk, dtype=np.float32)
+                        if is_first_chunk:
+                            first_frame_steps = raw_steps[:action_per_frame]
+                            kv_steps = np.concatenate([first_frame_steps, executed_steps], axis=0)
+                        else:
+                            kv_steps = executed_steps
+
+                        if kv_steps.shape[0] == 0:
+                            last_state_for_kv = None
+                        else:
+                            kv_frames = kv_steps.shape[0] // action_per_frame
+                            kv_steps = kv_steps[: kv_frames * action_per_frame]
+                            last_state_for_kv = kv_steps.T.reshape(
+                                raw_action.shape[0], kv_frames, action_per_frame
+                            )
+                        # Keep video-rate key-frame sampling aligned with each newly
+                        # generated action chunk. Sampling across chunks causes drift
+                        # and produces obs/state mismatch for compute_kv_cache.
+                        action_step_in_chunk = 0
                         is_first_chunk = False
 
                     action = list(action_plan.popleft())
@@ -233,7 +267,7 @@ def eval_libero(cfg: Args) -> None:
                         new_img, new_wrist = _obs_to_frame(obs)
                         # only keep one frame per action_per_frame steps (video rate)
                         # sample the LAST frame of each latent-frame window
-                        if action_step_in_chunk % cfg.action_per_frame == 0:
+                        if action_step_in_chunk % current_action_per_frame == 0:
                             key_frame_list.append(
                                 {
                                     OBS_IMAGE_KEY: new_img,
