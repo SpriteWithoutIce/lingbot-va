@@ -28,6 +28,45 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
+from diffusers import AutoencoderKLWan
+from diffusers.pipelines.wan.pipeline_wan import prompt_clean
+from transformers import T5TokenizerFast, UMT5EncoderModel
+
+def get_text_emb(prompt, tokenizer, text_encoder, device, dtype,
+                 max_sequence_length=512):
+    """与 wan_va_server._get_t5_prompt_embeds 逻辑相同：
+    tokenize → encode → 截到实际 token 数 → pad 回 max_sequence_length。
+    返回 (max_sequence_length, dim) 的 bfloat16 张量。"""
+    if isinstance(prompt, str):
+        prompt = [prompt]
+    prompt = [prompt_clean(u) for u in prompt]
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    input_ids = text_inputs.input_ids.to(device)
+    mask = text_inputs.attention_mask.to(device)
+    seq_lens = mask.gt(0).sum(dim=1).long()
+
+    with torch.no_grad():
+        embeds = text_encoder(input_ids, attention_mask=mask).last_hidden_state
+    embeds = embeds.to(dtype=dtype, device=device)
+
+    # 截掉 padding，再 pad 回 max_sequence_length（与 server 一致）
+    embeds = [u[:v] for u, v in zip(embeds, seq_lens)]
+    embeds = torch.stack([
+        torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+        for u in embeds
+    ], dim=0)
+    return embeds[0]  # (max_sequence_length, dim)
+
 
 # 添加 Wan2.2 到 path
 def _add_wan22(wan22_root):
@@ -97,24 +136,44 @@ def main():
     parser.add_argument("--wan22_root", type=str, default="/home/jwhe/linyihan/Wan2.2",
                         help="Path to Wan2.2 repo root")
     parser.add_argument("--ckpt_dir", type=str, default="/home/jwhe/linyihan/Wan2.2-TI2V-5B",
-                        help="Path to Wan2.2-TI2V-5B checkpoint (contains Wan2.2_VAE.pth, models_t5_umt5-xxl-enc-bf16.pth, google/umt5-xxl tokenizer)")
+                        help="Fallback checkpoint dir (used if vae_dir not set)")
+    parser.add_argument("--vae_dir", type=str, default=None,
+                        help="Path to diffusers-format VAE directory (AutoencoderKLWan). "
+                             "Defaults to <ckpt_dir>/vae if not set.")
     parser.add_argument("--dataset_path", type=str, required=True,
                         help="Root of one LeRobot dataset (e.g. .../libero_spatial_dataset)")
     parser.add_argument("--video_keys", type=str, nargs="+",
-                        default=["observation.images.cam_high", "observation.images.cam_left_wrist", "observation.images.cam_right_wrist"],
+                        default=["observation.images.image", "observation.images.wrist_image"],
                         help="Camera keys under videos/chunk-xxx/")
     parser.add_argument("--target_fps", type=int, default=None,
                         help="If set, sample frames at this fps; else use all frames in [start_frame, end_frame]")
+    parser.add_argument("--frame_stride", type=int, default=None,
+                        help="If set, sample every N-th frame (e.g. 4 means frames 0,4,8,...). "
+                             "Takes priority over --target_fps.")
+    parser.add_argument("--height", type=int, default=None,
+                        help="Target height for cam_high (first video_key). "
+                             "If not set, no resizing is performed.")
+    parser.add_argument("--width", type=int, default=None,
+                        help="Target width for cam_high (first video_key). "
+                             "If not set, no resizing is performed.")
+    parser.add_argument("--wrist_height", type=int, default=None,
+                        help="Target height for wrist cameras (remaining video_keys). "
+                             "Defaults to height//2 if not set (robotwin_tshape behavior). "
+                             "Set to the same as --height for single-wrist datasets (e.g. libero).")
+    parser.add_argument("--wrist_width", type=int, default=None,
+                        help="Target width for wrist cameras (remaining video_keys). "
+                             "Defaults to width//2 if not set (robotwin_tshape behavior). "
+                             "Set to the same as --width for single-wrist datasets (e.g. libero).")
+    parser.add_argument("--text_encoder_dir", type=str,
+                        default="/home/jwhe/linyihan/lingbot-va-base/text_encoder",
+                        help="HuggingFace-format UMT5 text encoder directory.")
+    parser.add_argument("--tokenizer_dir", type=str,
+                        default="/home/jwhe/linyihan/lingbot-va-base/tokenizer",
+                        help="HuggingFace-format T5 tokenizer directory.")
     parser.add_argument("--max_episodes", type=int, default=None,
                         help="Process only first N episodes (for debugging)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
-
-    _add_wan22(args.wan22_root)
-    from wan.modules.vae2_2 import Wan2_2_VAE
-    from wan.modules.t5 import T5EncoderModel
-    from wan.configs import WAN_CONFIGS
-    config = WAN_CONFIGS["ti2v-5B"]
 
     ckpt = Path(args.ckpt_dir)
     dataset_root = Path(args.dataset_path)
@@ -142,27 +201,24 @@ def main():
         episodes = episodes[: args.max_episodes]
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    vae_path = ckpt / config.vae_checkpoint
-    t5_path = ckpt / config.t5_checkpoint
-    t5_tok = config.t5_tokenizer
-    if (ckpt / t5_tok).exists():
-        tokenizer_path = str(ckpt / t5_tok)
-    else:
-        tokenizer_path = t5_tok
+    vae_dir = args.vae_dir if args.vae_dir is not None else str(ckpt / "vae")
 
-    print("Loading Wan2.2 VAE from", vae_path)
-    vae = Wan2_2_VAE(
-        vae_pth=str(vae_path),
-        device=device,
-    )
-    print("Loading T5 encoder from", t5_path)
-    text_encoder = T5EncoderModel(
-        text_len=config.text_len,
-        dtype=config.t5_dtype,
-        device=device,
-        checkpoint_path=str(t5_path),
-        tokenizer_path=tokenizer_path,
-    )
+    print("Loading Wan2.2 VAE (AutoencoderKLWan) from", vae_dir)
+    vae_raw = AutoencoderKLWan.from_pretrained(vae_dir, torch_dtype=torch.bfloat16).to(device)
+    vae_device = next(vae_raw.parameters()).device
+    # 预先把 latents_mean / latents_std 转成 tensor，用于归一化（与 server normalize_latents 一致）
+    _lat_mean = torch.tensor(vae_raw.config.latents_mean,
+                             dtype=torch.float32, device=vae_device).view(-1, 1, 1, 1)
+    _lat_std_inv = (1.0 / torch.tensor(vae_raw.config.latents_std,
+                                       dtype=torch.float32, device=vae_device)).view(-1, 1, 1, 1)
+
+    print("Loading tokenizer from", args.tokenizer_dir)
+    tokenizer = T5TokenizerFast.from_pretrained(args.tokenizer_dir)
+    print("Loading text encoder (UMT5) from", args.text_encoder_dir)
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        args.text_encoder_dir, torch_dtype=torch.bfloat16
+    ).to(device)
+    text_encoder.eval()
 
     latents_root = dataset_root / "latents"
     chunk = "chunk-000"
@@ -185,11 +241,14 @@ def main():
                 continue
 
             # Sample frame indices
-            if args.target_fps is not None and args.target_fps != ori_fps:
-                import math
+            if args.frame_stride is not None:
+                # 固定步长：每隔 frame_stride 帧取一帧，不依赖 fps
+                frame_ids = list(range(start_frame, end_frame, args.frame_stride))
+            elif args.target_fps is not None and args.target_fps != ori_fps:
+                # 按 fps 比例采样，步长取整数以与标准数据集一致
+                step = max(1, round(ori_fps / args.target_fps))
                 num_out = max(1, int((end_frame - start_frame) * args.target_fps / ori_fps))
-                step = (end_frame - start_frame) / num_out
-                frame_ids = [start_frame + int(i * step) for i in range(num_out)]
+                frame_ids = [start_frame + i * step for i in range(num_out)]
                 frame_ids = [min(f, end_frame - 1) for f in frame_ids]
             else:
                 frame_ids = list(range(start_frame, end_frame))
@@ -213,23 +272,34 @@ def main():
                 tqdm.write(f"Skip episode {episode_index} (no frames)")
                 continue
             _, T_in, video_height, video_width = first_frames.shape
-            if T_in != video_num_frames:
-                first_frames = first_frames[:, :video_num_frames]
+            # 按 frame_ids 抽取对应帧（相对于 start_frame 的局部索引）
+            local_ids = [min(f - start_frame, T_in - 1) for f in frame_ids]
+            first_frames = first_frames[:, local_ids, :, :]
+            # resize cam_high to target resolution (C, T, H, W) → interpolate on H, W
+            if args.height is not None and args.width is not None:
+                C, T, H, W = first_frames.shape
+                first_frames = F.interpolate(
+                    first_frames.permute(1, 0, 2, 3),  # (T, C, H, W)
+                    size=(args.height, args.width),
+                    mode='bilinear',
+                    align_corners=False,
+                ).permute(1, 0, 2, 3)  # (C, T, H, W)
+                video_height, video_width = args.height, args.width
             video_tensor = first_frames
             video_tensor = (video_tensor * 2.0 - 1.0).to(torch.bfloat16)
 
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16), torch.no_grad():
-                lat_list = vae.encode([video_tensor])
-            if lat_list is None or len(lat_list) == 0:
-                tqdm.write(f"Skip episode {episode_index} (VAE encode failed)")
-                continue
-            z = lat_list[0]
+            x_in = video_tensor.unsqueeze(0).to(vae_device).to(torch.bfloat16)
+            with torch.no_grad():
+                enc_out = vae_raw.encode(x_in)
+            z = enc_out.latent_dist.mean.squeeze(0)  # (C, T', H', W')
+            z = ((z.float() - _lat_mean) * _lat_std_inv).to(torch.bfloat16)
             latent_num_frames, latent_height, latent_width = int(z.shape[1]), int(z.shape[2]), int(z.shape[3])
             z_flat = z.reshape(z.shape[0], -1).permute(1, 0).contiguous()  # (T*H*W, C)
             latent = z_flat.to(torch.bfloat16)
 
-            text_emb_list = text_encoder([action_text], device)
-            text_emb = text_emb_list[0].to(torch.bfloat16)
+            text_emb = get_text_emb(
+                action_text, tokenizer, text_encoder, device, torch.bfloat16
+            )
 
             out = {
                 "latent": latent,
@@ -259,22 +329,33 @@ def main():
                 frames_k = load_video_frames(video_file_k, start_frame, end_frame, ori_fps, device)
                 if frames_k is None or frames_k.shape[1] == 0:
                     continue
-                if frames_k.shape[1] != video_num_frames:
-                    frames_k = frames_k[:, :video_num_frames]
+                T_in_k = frames_k.shape[1]
+                local_ids_k = [min(f - start_frame, T_in_k - 1) for f in frame_ids]
+                frames_k = frames_k[:, local_ids_k, :, :]
+                # resize wrist cameras to target resolution
+                if args.height is not None and args.width is not None:
+                    wrist_h = args.wrist_height if args.wrist_height is not None else args.height // 2
+                    wrist_w = args.wrist_width if args.wrist_width is not None else args.width // 2
+                    frames_k = F.interpolate(
+                        frames_k.permute(1, 0, 2, 3),  # (T, C, H, W)
+                        size=(wrist_h, wrist_w),
+                        mode='bilinear',
+                        align_corners=False,
+                    ).permute(1, 0, 2, 3)  # (C, T, H, W)
                 frames_k = (frames_k * 2.0 - 1.0).to(torch.bfloat16)
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16), torch.no_grad():
-                    lat_k = vae.encode([frames_k])
-                if lat_k is None or len(lat_k) == 0:
-                    continue
-                zk = lat_k[0]
+                xk_in = frames_k.unsqueeze(0).to(vae_device).to(torch.bfloat16)
+                with torch.no_grad():
+                    enc_out_k = vae_raw.encode(xk_in)
+                zk = enc_out_k.latent_dist.mean.squeeze(0)  # (C, T', H', W')
+                zk = ((zk.float() - _lat_mean) * _lat_std_inv).to(torch.bfloat16)
                 zk_flat = zk.reshape(zk.shape[0], -1).permute(1, 0).contiguous().to(torch.bfloat16)
                 if int(zk.shape[1]) != int(out["latent_num_frames"]):
                     print(f"Skip episode {episode_index} (latent_num_frames mismatch): {int(zk.shape[1])} != {int(out['latent_num_frames'])}")
                 out_k = {
                     "latent": zk_flat,
-                    "latent_num_frames": out["latent_num_frames"],
-                    "latent_height": out["latent_height"],
-                    "latent_width": out["latent_width"],
+                    "latent_num_frames": int(zk.shape[1]),
+                    "latent_height": int(zk.shape[2]),
+                    "latent_width": int(zk.shape[3]),
                     "video_num_frames": out["video_num_frames"],
                     "video_height": int(frames_k.shape[2]),
                     "video_width": int(frames_k.shape[3]),

@@ -313,7 +313,7 @@ class Trainer:
         for batch_idx, batch in enumerate(self.train_loader):
             if self.config.rank == 0:
                 episode_indices = batch.get('episode_index', None)
-                print(f"[batch {batch_idx}] episode_index: {episode_indices}", flush=True)
+                # print(f"[batch {batch_idx}] episode_index: {episode_indices}", flush=True)
             # transfer batch to device
             batch = self.convert_input_format(batch)
 

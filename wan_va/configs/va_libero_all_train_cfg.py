@@ -40,4 +40,4 @@ va_libero_all_train_cfg.warmup_steps = 10
 va_libero_all_train_cfg.batch_size = 1
 va_libero_all_train_cfg.gradient_accumulation_steps = 1
 # 四套数据一起训可适当增加步数
-va_libero_all_train_cfg.num_steps = 3000
+va_libero_all_train_cfg.num_steps = 4000

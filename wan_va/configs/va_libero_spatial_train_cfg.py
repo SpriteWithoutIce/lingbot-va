@@ -15,7 +15,7 @@ va_libero_spatial_train_cfg.empty_emb_path = os.path.join(
     va_libero_spatial_train_cfg.dataset_path, 'empty_emb.pt'
 )
 
-va_libero_spatial_train_cfg.enable_wandb = False
+va_libero_spatial_train_cfg.enable_wandb = True
 va_libero_spatial_train_cfg.load_worker = 0
 va_libero_spatial_train_cfg.save_interval = 500
 va_libero_spatial_train_cfg.gc_interval = 10  # 每步清缓存，缓解 80GB 单卡 OOM

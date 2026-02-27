@@ -13,13 +13,13 @@ va_libero_all_cfg.infer_mode = 'server'
 va_libero_all_cfg.wan22_pretrained_model_name_or_path = "/home/jwhe/linyihan/lingbot-va-base"
 
 va_libero_all_cfg.attn_window = 72
-va_libero_all_cfg.frame_chunk_size = 2
+va_libero_all_cfg.frame_chunk_size = 4
 va_libero_all_cfg.env_type = 'libero'
 
 va_libero_all_cfg.height = 256
 va_libero_all_cfg.width = 256
 va_libero_all_cfg.action_dim = 30
-va_libero_all_cfg.action_per_frame = 16
+va_libero_all_cfg.action_per_frame = 4
 va_libero_all_cfg.obs_cam_keys = [
     'observation.images.image',
     'observation.images.wrist_image',
