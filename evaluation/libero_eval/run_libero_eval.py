@@ -228,6 +228,7 @@ def eval_libero(cfg: Args) -> None:
                         # reset: collect video-rate frames for the next kv_cache call
                         key_frame_list = []
                         chunk, action_per_frame = _server_action_to_env_actions(
+                        chunk, action_per_frame = _server_action_to_env_actions(
                             raw_action,
                             cfg.replan_steps,
                             skip_first_frame=is_first_chunk,
@@ -266,6 +267,7 @@ def eval_libero(cfg: Args) -> None:
                         new_img, new_wrist = _obs_to_frame(obs)
                         # only keep one frame per action_per_frame steps (video rate)
                         # sample the LAST frame of each latent-frame window
+                        if action_step_in_chunk % current_action_per_frame == 0:
                         if action_step_in_chunk % current_action_per_frame == 0:
                             key_frame_list.append(
                                 {
