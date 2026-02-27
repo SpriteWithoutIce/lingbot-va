@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import datetime
 import logging
 import pathlib
 
@@ -119,6 +120,7 @@ class Args:
     action_per_frame: int = 4
 
 
+
 def eval_libero(cfg: Args) -> None:
     np.random.seed(cfg.seed)
 
@@ -145,6 +147,29 @@ def eval_libero(cfg: Args) -> None:
     client = WebsocketClientPolicy(host=cfg.host, port=cfg.port)
 
     total_episodes, total_successes = 0, 0
+    
+    def _obs_to_frame(ob):
+        img = np.ascontiguousarray(
+            ob["agentview_image"][::-1, ::-1]
+        )
+        wrist_img = np.ascontiguousarray(
+            ob["robot0_eye_in_hand_image"][::-1, ::-1]
+        )
+        img = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(
+                img, cfg.resize_size, cfg.resize_size
+            )
+        )
+        wrist_img = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(
+                wrist_img, cfg.resize_size, cfg.resize_size
+            )
+        )
+        return {
+            OBS_IMAGE_KEY: img,
+            OBS_WRIST_KEY: wrist_img,
+        }
+    
     for task_id in tqdm.tqdm(range(num_tasks_in_suite), desc="task"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
@@ -157,6 +182,14 @@ def eval_libero(cfg: Args) -> None:
             range(cfg.num_trials_per_task), desc="episode", leave=False
         ):
             env.reset()
+            # Reset server for new episode (set prompt)
+            client.infer({"reset": True, "prompt": task_description})
+
+            first = True
+            full_obs_list = []
+            gen_video_list = []
+            full_action_history = []
+            
             action_plan = collections.deque()
             last_state_for_kv = None
             key_frame_list = []        # frames at VIDEO rate (one per action_per_frame steps)
@@ -164,32 +197,15 @@ def eval_libero(cfg: Args) -> None:
             current_action_per_frame = cfg.action_per_frame
 
             obs = env.set_init_state(initial_states[episode_idx])
+            full_obs_list.append(_obs_to_frame(obs))
             t = 0
             replay_images = []
             done = False
             is_first_chunk = True
 
-            # Reset server for new episode (set prompt)
-            client.infer({"reset": True, "prompt": task_description})
+            first_obs = None
 
-            def _obs_to_frame(ob):
-                img = np.ascontiguousarray(
-                    ob["agentview_image"][::-1, ::-1]
-                )
-                wrist_img = np.ascontiguousarray(
-                    ob["robot0_eye_in_hand_image"][::-1, ::-1]
-                )
-                img = image_tools.convert_to_uint8(
-                    image_tools.resize_with_pad(
-                        img, cfg.resize_size, cfg.resize_size
-                    )
-                )
-                wrist_img = image_tools.convert_to_uint8(
-                    image_tools.resize_with_pad(
-                        wrist_img, cfg.resize_size, cfg.resize_size
-                    )
-                )
-                return img, wrist_img
+            
 
             while t < max_steps + cfg.num_steps_wait:
                 try:
@@ -197,89 +213,97 @@ def eval_libero(cfg: Args) -> None:
                         obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
+                    if first:
+                        first_obs = _obs_to_frame(obs)
+                    ret = client.infer(dict(obs=first_obs, prompt=task_description)) #(TASK_ENV, model, observation)
+                    action = ret['action']
+                    key_frame_list = []
 
-                    img, wrist_img = _obs_to_frame(obs)
-                    replay_images.append(img)
+                    assert action.shape[2] % 4 == 0
+                    action_per_frame = action.shape[2] // 4
 
-                    if not action_plan:
-                        if (
-                            last_state_for_kv is not None
-                            and len(key_frame_list) > 0
-                        ):
-                            client.infer(
-                                {
-                                    "obs": key_frame_list,
-                                    "compute_kv_cache": True,
-                                    "state": last_state_for_kv,
-                                    "prompt": task_description,
-                                }
-                            )
-                        obs_dict = {
-                            "obs": [
-                                {
-                                    OBS_IMAGE_KEY: img,
-                                    OBS_WRIST_KEY: wrist_img,
-                                }
-                            ],
-                            "prompt": task_description,
-                        }
-                        resp = client.infer(obs_dict)
-                        raw_action = resp["action"]
-                        # reset: collect video-rate frames for the next kv_cache call
-                        key_frame_list = []
-                        chunk, action_per_frame = _server_action_to_env_actions(
-                        chunk, action_per_frame = _server_action_to_env_actions(
-                            raw_action,
-                            cfg.replan_steps,
-                            skip_first_frame=is_first_chunk,
-                        )
-                        action_plan.extend(chunk)
-                        current_action_per_frame = action_per_frame
+                    start_idx = 1 if first else 0
+                    # print(action.shape)
+                    for i in range(start_idx, action.shape[1]):
+                        for j in range(action.shape[2]):
+                            raw_action_step = action[:, i, j].flatten() 
+                            full_action_history.append(raw_action_step)
+                            ee_action = action[:, i, j]
+                            # print(ee_action.shape)
+                            ee_action = ee_action[:8]
 
-                        # Build the action tensor used by compute_kv_cache from ACTUALLY
-                        # executed steps, and keep its latent-frame grouping aligned
-                        # with video-rate keyframes.
-                        raw_steps = raw_action.reshape(raw_action.shape[0], -1).T
-                        executed_steps = np.asarray(chunk, dtype=np.float32)
-                        if is_first_chunk:
-                            first_frame_steps = raw_steps[:action_per_frame]
-                            kv_steps = np.concatenate([first_frame_steps, executed_steps], axis=0)
-                        else:
-                            kv_steps = executed_steps
+                            obs, _, done, _ = env.step(ee_action)
+                            if (j+1) % action_per_frame == 0:
+                                key_frame_list.append(_obs_to_frame(obs))
+                                full_obs_list.append(_obs_to_frame(obs))
+                                replay_images.append(_obs_to_frame(obs)[OBS_IMAGE_KEY])
 
-                        if kv_steps.shape[0] == 0:
-                            last_state_for_kv = None
-                        else:
-                            kv_frames = kv_steps.shape[0] // action_per_frame
-                            kv_steps = kv_steps[: kv_frames * action_per_frame]
-                            last_state_for_kv = kv_steps.T.reshape(
-                                raw_action.shape[0], kv_frames, action_per_frame
-                            )
-                        # Keep video-rate key-frame sampling aligned with each newly
-                        # generated action chunk. Sampling across chunks causes drift
-                        # and produces obs/state mismatch for compute_kv_cache.
-                        is_first_chunk = False
-
-                    action = list(action_plan.popleft())
-                    obs, reward, done, info = env.step(action)
-                    action_step_in_chunk += 1
-                    if not done:
-                        new_img, new_wrist = _obs_to_frame(obs)
-                        # only keep one frame per action_per_frame steps (video rate)
-                        # sample the LAST frame of each latent-frame window
-                        if action_step_in_chunk % current_action_per_frame == 0:
-                        if action_step_in_chunk % current_action_per_frame == 0:
-                            key_frame_list.append(
-                                {
-                                    OBS_IMAGE_KEY: new_img,
-                                    OBS_WRIST_KEY: new_wrist,
-                                }
-                            )
+                    first = False
+                    client.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
+                    
                     if done:
                         task_successes += 1
                         total_successes += 1
                         break
-                    t += 1
+                    t += action.shape[1] * action.shape[2]
+                    # img, wrist_img = _obs_to_frame(obs)
+                    # replay_images.append(img)
+
+                    # if not action_plan:
+                    #     if (
+                    #         last_state_for_kv is not None
+                    #         and len(key_frame_list) > 0
+                    #     ):
+                    #         client.infer(
+                    #             {
+                    #                 "obs": key_frame_list,
+                    #                 "compute_kv_cache": True,
+                    #                 "state": last_state_for_kv,
+                    #                 "prompt": task_description,
+                    #             }
+                    #         )
+                    #     obs_dict = {
+                    #         "obs": [
+                    #             {
+                    #                 OBS_IMAGE_KEY: img,
+                    #                 OBS_WRIST_KEY: wrist_img,
+                    #             }
+                    #         ],
+                    #         "prompt": task_description,
+                    #     }
+                    #     resp = client.infer(obs_dict)
+                    #     raw_action = resp["action"]
+                    #     # reset: collect video-rate frames for the next kv_cache call
+                    #     key_frame_list = []
+                    #     chunk, action_per_frame = _server_action_to_env_actions(
+                    #         raw_action,
+                    #         cfg.replan_steps,
+                    #         skip_first_frame=is_first_chunk,
+                    #     )
+                    #     action_plan.extend(chunk)
+                    #     current_action_per_frame = action_per_frame
+                    #     action_step_in_chunk = 0
+
+                    #     # Pass the full raw action as KV-cache state (same as robotwin).
+                    #     # raw_action shape: (C, frame_chunk_size, action_per_frame).
+                    #     last_state_for_kv = raw_action
+                    #     is_first_chunk = False
+
+                    # action = list(action_plan.popleft())
+                    # obs, reward, done, info = env.step(action)
+                    # action_step_in_chunk += 1
+                    # if not done:
+                    #     new_img, new_wrist = _obs_to_frame(obs)
+                    #     # only keep one frame per action_per_frame steps (video rate)
+                    #     # sample the LAST frame of each latent-frame window
+                    #     if action_step_in_chunk % current_action_per_frame == 0:
+                    #         key_frame_list.append(
+                    #             {
+                    #                 OBS_IMAGE_KEY: new_img,
+                    #                 OBS_WRIST_KEY: new_wrist,
+                    #             }
+                    #         )
+                    
                 except Exception as e:
                     logging.error("Caught exception: %s", e)
                     break
@@ -289,7 +313,6 @@ def eval_libero(cfg: Args) -> None:
 
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = (
                 pathlib.Path(cfg.video_out_path)
