@@ -15,9 +15,9 @@ va_libero_spatial_train_cfg.empty_emb_path = os.path.join(
     va_libero_spatial_train_cfg.dataset_path, 'empty_emb.pt'
 )
 
-va_libero_spatial_train_cfg.enable_wandb = True
+va_libero_spatial_train_cfg.enable_wandb = False
 va_libero_spatial_train_cfg.load_worker = 0
-va_libero_spatial_train_cfg.save_interval = 250
+va_libero_spatial_train_cfg.save_interval = 100
 va_libero_spatial_train_cfg.gc_interval = 10
 va_libero_spatial_train_cfg.cfg_prob = 0.1
 
@@ -27,7 +27,7 @@ va_libero_spatial_train_cfg.beta2 = 0.95
 va_libero_spatial_train_cfg.weight_decay = 0.1
 va_libero_spatial_train_cfg.warmup_steps = 10
 va_libero_spatial_train_cfg.batch_size = 1
-va_libero_spatial_train_cfg.gradient_accumulation_steps = 16
+va_libero_spatial_train_cfg.gradient_accumulation_steps = 1
 va_libero_spatial_train_cfg.num_steps = 500
 
 # 开环测试

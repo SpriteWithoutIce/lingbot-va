@@ -13,7 +13,7 @@ va_libero_spatial_cfg.infer_mode = 'server'
 va_libero_spatial_cfg.wan22_pretrained_model_name_or_path = "/home/jwhe/linyihan/lingbot-va-base"
 
 va_libero_spatial_cfg.attn_window = 72
-va_libero_spatial_cfg.frame_chunk_size = 4
+va_libero_spatial_cfg.frame_chunk_size = 8
 va_libero_spatial_cfg.env_type = 'libero'
 
 va_libero_spatial_cfg.height = 256
@@ -27,9 +27,9 @@ va_libero_spatial_cfg.obs_cam_keys = [
 va_libero_spatial_cfg.guidance_scale = 5
 va_libero_spatial_cfg.action_guidance_scale = 1
 
-va_libero_spatial_cfg.num_inference_steps = 25
+va_libero_spatial_cfg.num_inference_steps = 10
 va_libero_spatial_cfg.video_exec_step = -1
-va_libero_spatial_cfg.action_num_inference_steps = 50
+va_libero_spatial_cfg.action_num_inference_steps = 20
 
 va_libero_spatial_cfg.snr_shift = 5.0
 va_libero_spatial_cfg.action_snr_shift = 1.0

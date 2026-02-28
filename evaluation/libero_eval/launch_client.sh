@@ -11,9 +11,11 @@ PORT=${2:-29536}
 REPLAN_STEPS=${REPLAN_STEPS:-10}
 VIDEO_OUT=${VIDEO_OUT:-data/libero/videos}
 
+LOGFILE=logs/eval_libero-spatial_$(date +"%Y%m%d_%H%M%S").log
+
 # LIBERO env (conda with libero installed) must be active for client
 python -m evaluation.libero_eval.run_libero_eval \
     --host 127.0.0.1 \
     --port "$PORT" \
     --task_suite_name "$TASK_SUITE" \
-    --video_out_path "$VIDEO_OUT"
+    --video_out_path "$VIDEO_OUT" > ${LOGFILE} 2>&1
