@@ -6,3 +6,4 @@ assets/
 example/
 *.pdf
 server_out/
+*.txt

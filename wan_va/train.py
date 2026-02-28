@@ -94,6 +94,7 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
+            attn_mode="flex",
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -389,7 +390,124 @@ class Trainer:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
 
+                eval_interval = getattr(self.config, 'eval_interval', 0)
+                eval_num_samples = getattr(self.config, 'eval_num_samples', 4)
+                if eval_interval > 0 and self.step % eval_interval == 0:
+                    # 从当前 loader 收集若干 batch 做开环测试
+                    eval_batches = []
+                    for _b in self.train_loader:
+                        eval_batches.append(_b)
+                        if len(eval_batches) >= eval_num_samples:
+                            break
+                    self.run_open_loop_eval(eval_batches)
+
         progress_bar.close()
+
+    @torch.no_grad()
+    def run_open_loop_eval(self, eval_batches):
+        """从训练数据取若干 batch，GT latent 作为干净条件，对 action 做完整去噪，计算 action MSE。
+        去噪逻辑与 wan_va_server._infer 对齐：
+          - action frame 0 置零作为条件帧（timestep=0）
+          - 每步后重置 frame 0 = 0，并应用 action_mask
+          - 直接迭代 scheduler.timesteps（extra_one_step 保证最后一步 sigma_=0）
+          - 最终结果取 noisy_actions（scheduler.step 累积结果）
+        """
+        self.transformer.eval()
+
+        eval_action_scheduler = FlowMatchScheduler(
+            shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
+        num_steps = getattr(self.config, 'eval_action_num_inference_steps', 10)
+        eval_action_scheduler.set_timesteps(num_steps)
+        # 直接用 scheduler.timesteps，不额外 pad 0（无 KV cache 时不需要）
+        action_timesteps = eval_action_scheduler.timesteps
+
+        total_mse = 0.0
+        total_count = 0
+
+        for batch in eval_batches:
+            batch = self.convert_input_format(batch)
+            latent_gt   = batch['latents']       # (B, C, F, H, W)
+            action_gt   = batch['actions']       # (B, C, FA, NA, 1)
+            text_emb    = batch['text_emb']
+            action_mask = batch['actions_mask']  # (B, C, FA, NA, 1) bool
+
+            B, C, LF, H, W = latent_gt.shape
+            _, CA, FA, NA, _ = action_gt.shape
+            patch_f, patch_h, patch_w = self.patch_size
+
+            latent_grid_id = get_mesh_id(
+                LF // patch_f, H // patch_h, W // patch_w,
+                t=0, f_w=1, f_shift=0, action=False
+            ).to(self.device)[None].repeat(B, 1, 1)
+
+            action_grid_id = get_mesh_id(
+                FA, NA, 1, t=1, f_w=1, f_shift=0, action=True
+            ).to(self.device)[None].repeat(B, 1, 1)
+
+            # latent 全部帧干净（timestep=0），对应 server latent_cond 逻辑
+            latent_dict = dict(
+                timesteps=torch.zeros(B, LF, device=self.device),
+                cond_timesteps=torch.zeros(B, LF, device=self.device),
+                noisy_latents=latent_gt.to(self.dtype),
+                latent=latent_gt.to(self.dtype),
+                text_emb=text_emb,
+                grid_id=latent_grid_id,
+            )
+
+            # action 从纯噪声出发
+            noisy_actions = torch.randn_like(action_gt, dtype=self.dtype)
+            # frame 0 = 条件帧（置零）；应用 action_mask（未使用 channel → 0）
+            noisy_actions[:, :, 0:1] = 0.0
+            noisy_actions = noisy_actions * action_mask.float()
+
+            for t in action_timesteps:
+                # frame 0 的 timestep = 0（clean cond），其余帧 = t
+                ts = torch.full((B, FA), t.item(), device=self.device)
+                ts[:, 0] = 0.0
+
+                action_dict = dict(
+                    timesteps=ts,
+                    cond_timesteps=torch.zeros(B, FA, device=self.device),
+                    noisy_latents=noisy_actions,
+                    latent=torch.zeros_like(noisy_actions),
+                    text_emb=text_emb,
+                    actions_mask=action_mask,
+                    grid_id=action_grid_id,
+                )
+                input_dict = {
+                    'latent_dict': latent_dict,
+                    'action_dict': action_dict,
+                    'chunk_size': 1,
+                    'window_size': 64,
+                }
+                _, action_pred_raw = self.transformer(input_dict, train_mode=True)
+                action_pred = rearrange(action_pred_raw, 'b (f n) c -> b c f n 1', f=FA)  # FA = latent action frames
+
+                # scheduler.step：extra_one_step 保证最后一步 sigma_=0（直接到干净样本）
+                noisy_actions = eval_action_scheduler.step(
+                    action_pred, t, noisy_actions, return_dict=False)
+                # 每步后重置 frame 0 = 0；重新应用 mask（与 server 一致）
+                noisy_actions[:, :, 0:1] = 0.0
+                noisy_actions = noisy_actions * action_mask.float()
+
+            # 最终结果 = noisy_actions（所有 scheduler.step 后的累积去噪结果）
+            mask = action_mask.float()
+            mse = F.mse_loss(noisy_actions.float(), action_gt.float(), reduction='none')
+            mse_val = (mse * mask).sum() / (mask.sum() + 1e-6)
+            total_mse += mse_val.item()
+            total_count += 1
+
+        avg_mse = total_mse / max(total_count, 1)
+
+        # 训练 loss 在 self.step += 1 之前记录（即 step N-1），
+        # eval 在 step += 1 之后触发，用 self.step - 1 对齐到同一个 step 轴
+        log_step = self.step - 1
+        if self.config.rank == 0:
+            logger.info(f"[OpenLoop Eval step {log_step}] action MSE = {avg_mse:.6f}")
+            if self.config.enable_wandb:
+                self.wandb.log({'eval/open_loop_action_mse': avg_mse}, step=log_step)
+
+        self.transformer.train()
 
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""

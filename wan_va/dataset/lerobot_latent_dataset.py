@@ -357,30 +357,30 @@ class LatentLeRobotDataset(LeRobotDataset):
         #     right_action = np.zeros((n, 7), dtype=np.float32)
         #     right_gripper = np.zeros((n, 1), dtype=action.dtype)
         # action = np.concatenate([left_action, left_gripper, right_action, right_gripper], axis=1)
-        # action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
         required_action_num = latent_frame_num * frame_stride * 4
-        # action = action[:required_action_num]
-        # action_mask = np.ones_like(action, dtype='bool')
-        current_len = action.shape[0]
-        if current_len >= required_action_num:
-            action = action[:required_action_num]
-            action_mask = np.ones((required_action_num, action.shape[1]), dtype=bool)
-        else:
-            pad_len = required_action_num - current_len
-            action_mask = np.ones((current_len, action.shape[1]), dtype=bool)
-            action = np.pad(
-                action,
-                ((0, pad_len), (0, 0)),
-                mode='constant',
-                constant_values=0
-            )
-            action_mask = np.pad(
-                action_mask,
-                ((0, pad_len), (0, 0)),
-                mode='constant',
-                constant_values=False
-            )
+        action = action[:required_action_num]
+        action_mask = np.ones_like(action, dtype='bool')
+        # current_len = action.shape[0]
+        # if current_len >= required_action_num:
+        #     action = action[:required_action_num]
+        #     action_mask = np.ones((required_action_num, action.shape[1]), dtype=bool)
+        # else:
+        #     pad_len = required_action_num - current_len
+        #     action_mask = np.ones((current_len, action.shape[1]), dtype=bool)
+        #     action = np.pad(
+        #         action,
+        #         ((0, pad_len), (0, 0)),
+        #         mode='constant',
+        #         constant_values=0
+        #     )
+        #     action_mask = np.pad(
+        #         action_mask,
+        #         ((0, pad_len), (0, 0)),
+        #         mode='constant',
+        #         constant_values=False
+        #     )
         assert action.shape[0] == required_action_num
 
         action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)

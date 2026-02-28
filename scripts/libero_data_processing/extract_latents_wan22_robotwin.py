@@ -254,6 +254,10 @@ def main():
                 frame_ids = list(range(start_frame, end_frame))
 
             video_num_frames = len(frame_ids)
+            # Wan2.2 VAE 要求时间维度必须是 4 的倍数，截断多余帧
+            if video_num_frames % 4 != 0:
+                video_num_frames = (video_num_frames // 4) * 4
+                frame_ids = frame_ids[:video_num_frames]
             if video_num_frames == 0:
                 continue
 
@@ -343,6 +347,7 @@ def main():
                         align_corners=False,
                     ).permute(1, 0, 2, 3)  # (C, T, H, W)
                 frames_k = (frames_k * 2.0 - 1.0).to(torch.bfloat16)
+                # 整段视频一次性送入 VAE，输入 (1, C, T, H, W)
                 xk_in = frames_k.unsqueeze(0).to(vae_device).to(torch.bfloat16)
                 with torch.no_grad():
                     enc_out_k = vae_raw.encode(xk_in)

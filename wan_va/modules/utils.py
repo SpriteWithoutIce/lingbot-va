@@ -44,11 +44,13 @@ def load_transformer(
     transformer_path,
     torch_dtype,
     torch_device,
+    attn_mode="torch",
 ):
     print("loading transformer from", transformer_path)
     model = WanTransformer3DModel.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
+        attn_mode=attn_mode,
     )
     return model.to(torch_device)
 
