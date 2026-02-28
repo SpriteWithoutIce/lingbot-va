@@ -10,7 +10,7 @@ cd "$(dirname "$0")/../.."
 
 START_PORT=${START_PORT:-29536}
 MASTER_PORT=${MASTER_PORT:-29561}
-CKPT=${CKPT:-/home/jwhe/linyihan/lingbot-va/train_out/libero_spatial_posttrain/checkpoints_20260226_214154/checkpoint_step_1000}
+CKPT=${CKPT:-/home/jwhe/linyihan/lingbot-va/train_out/libero_spatial_posttrain/checkpoints_20260227_130644/checkpoint_step_500}
 SAVE_ROOT=${SAVE_ROOT:-./evaluation/libero_eval/server_out}
 mkdir -p "$SAVE_ROOT"
 

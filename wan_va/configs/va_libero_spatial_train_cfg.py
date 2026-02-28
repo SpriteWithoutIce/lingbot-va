@@ -17,10 +17,8 @@ va_libero_spatial_train_cfg.empty_emb_path = os.path.join(
 
 va_libero_spatial_train_cfg.enable_wandb = True
 va_libero_spatial_train_cfg.load_worker = 0
-va_libero_spatial_train_cfg.save_interval = 500
-va_libero_spatial_train_cfg.gc_interval = 10  # 每步清缓存，缓解 80GB 单卡 OOM
-# 降低 attention 窗口以省显存（默认 72 在 backward 时易 OOM）
-# va_libero_spatial_train_cfg.attn_window = 36
+va_libero_spatial_train_cfg.save_interval = 250
+va_libero_spatial_train_cfg.gc_interval = 10
 va_libero_spatial_train_cfg.cfg_prob = 0.1
 
 va_libero_spatial_train_cfg.learning_rate = 1e-5
@@ -29,5 +27,10 @@ va_libero_spatial_train_cfg.beta2 = 0.95
 va_libero_spatial_train_cfg.weight_decay = 0.1
 va_libero_spatial_train_cfg.warmup_steps = 10
 va_libero_spatial_train_cfg.batch_size = 1
-va_libero_spatial_train_cfg.gradient_accumulation_steps = 1
-va_libero_spatial_train_cfg.num_steps = 1000
+va_libero_spatial_train_cfg.gradient_accumulation_steps = 16
+va_libero_spatial_train_cfg.num_steps = 500
+
+# 开环测试
+va_libero_spatial_train_cfg.eval_interval = 10           # 每 N step 做一次开环测试（0 表示关闭）
+va_libero_spatial_train_cfg.eval_num_samples = 1          # 用多少个 batch 做 eval
+va_libero_spatial_train_cfg.eval_action_num_inference_steps = 50  # action 去噪步数
