@@ -5,7 +5,7 @@
 set -x
 umask 007
 
-NGPU=${NGPU:-"4"}
+NGPU=${NGPU:-"2"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 CONFIG_NAME=${CONFIG_NAME:-"libero_spatial_train"}
 SAVE_ROOT=${SAVE_ROOT:-"./train_out/libero_spatial_posttrain"}

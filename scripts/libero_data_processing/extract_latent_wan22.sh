@@ -6,7 +6,7 @@
 # done
 export CUDA_VISIBLE_DEVICES=2
 python scripts/libero_data_processing/extract_latents_wan22_robotwin.py \
-  --dataset_path /home/jwhe/linyihan/datasets/libero_lingbot/libero_spatial_dataset \
+  --dataset_path /home/jwhe/linyihan/datasets/libero_lingbot/libero_10_dataset \
   --wan22_root /home/jwhe/linyihan/Wan2.2 \
   --ckpt_dir /home/jwhe/linyihan/Wan2.2-TI2V-5B \
   --vae_dir /home/jwhe/linyihan/lingbot-va-base/vae \

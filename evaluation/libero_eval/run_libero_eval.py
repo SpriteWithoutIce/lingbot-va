@@ -102,6 +102,36 @@ def _server_action_to_env_actions(
     env_actions = env_actions[: full_windows * h]
     return env_actions, h
 
+def normalize_gripper_action(action: np.ndarray, binarize: bool = True) -> np.ndarray:
+    """
+    Normalize gripper action from [0,1] to [-1,+1] range.
+
+    This is necessary for some environments because the dataset wrapper
+    standardizes gripper actions to [0,1]. Note that unlike the other action
+    dimensions, the gripper action is not normalized to [-1,+1] by default.
+
+    Normalization formula: y = 2 * (x - orig_low) / (orig_high - orig_low) - 1
+
+    Args:
+        action: Action array with gripper action in the last dimension
+        binarize: Whether to binarize gripper action to -1 or +1
+
+    Returns:
+        np.ndarray: Action array with normalized gripper action
+    """
+    # Create a copy to avoid modifying the original
+    normalized_action = action.copy()
+
+    # Normalize the last action dimension to [-1,+1]
+    orig_low, orig_high = 0.0, 1.0
+    normalized_action[..., -1] = 2 * (normalized_action[..., -1] - orig_low) / (orig_high - orig_low) - 1
+
+    if binarize:
+        # Binarize to -1 or +1
+        normalized_action[..., -1] = np.sign(normalized_action[..., -1])
+
+    return normalized_action
+
 @dataclasses.dataclass
 class Args:
     host: str = "127.0.0.1"
@@ -111,7 +141,7 @@ class Args:
 
     task_suite_name: str = "libero_spatial"
     num_steps_wait: int = 10
-    num_trials_per_task: int = 1
+    num_trials_per_task: int = 10
 
     video_out_path: str = "data/libero/videos"
     seed: int = 7
@@ -165,6 +195,7 @@ def eval_libero(cfg: Args) -> None:
         env, task_description = _get_libero_env(
             task, LIBERO_ENV_RESOLUTION, cfg.seed
         )
+        task_description = str(task_description)
 
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(
@@ -172,6 +203,7 @@ def eval_libero(cfg: Args) -> None:
         ):
             env.reset()
             # Reset server for new episode (set prompt)
+            print(task_description)
             client.infer({"reset": True, "prompt": task_description})
 
             first = True
@@ -206,7 +238,9 @@ def eval_libero(cfg: Args) -> None:
                             raw_action_step = action[:, i, j].flatten() 
                             full_action_history.append(raw_action_step)
                             ee_action = action[:, i, j]
-                            ee_action = ee_action[:8]
+                            ee_action = ee_action[:7]
+                            ee_action = normalize_gripper_action(ee_action)
+                            ee_action[..., -1] *= -1.0
                             obs, _, done, _ = env.step(ee_action)
                             if (j+1) % action_per_frame == 0:
                                 key_frame_list.append(_obs_to_frame(obs))
@@ -268,8 +302,6 @@ def eval_libero(cfg: Args) -> None:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    # 用 tyro.cli(Args) 直接解析为 Args，得到 --host / --port 等扁平参数；
-    # 若用 tyro.cli(eval_libero) 会因参数名为 args 而得到 --cfg.host
     cfg = tyro.cli(Args)
     eval_libero(cfg)
 
