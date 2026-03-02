@@ -7,3 +7,4 @@ example/
 *.pdf
 server_out/
 *.txt
+wan_va/configs/
