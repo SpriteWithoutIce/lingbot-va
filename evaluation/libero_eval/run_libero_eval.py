@@ -141,7 +141,7 @@ class Args:
 
     task_suite_name: str = "libero_spatial"
     num_steps_wait: int = 10
-    num_trials_per_task: int = 10
+    num_trials_per_task: int = 1
 
     video_out_path: str = "data/libero/videos"
     seed: int = 7
@@ -159,7 +159,9 @@ def eval_libero(cfg: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info("Task suite: %s", cfg.task_suite_name)
 
-    pathlib.Path(cfg.video_out_path).mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    video_out_path = pathlib.Path(cfg.video_out_path) / f"{cfg.task_suite_name}_{run_timestamp}"
+    video_out_path.mkdir(parents=True, exist_ok=True)
 
     if cfg.task_suite_name == "libero_spatial":
         max_steps = 280
@@ -264,11 +266,8 @@ def eval_libero(cfg: Args) -> None:
 
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = (
-                pathlib.Path(cfg.video_out_path)
-                / f"rollout_{task_segment}_{suffix}_{timestamp}.mp4"
-            )
+            episode_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = video_out_path / f"rollout_{task_segment}_{suffix}_{episode_timestamp}.mp4"
             try:
                 imageio.mimwrite(
                     out_path,

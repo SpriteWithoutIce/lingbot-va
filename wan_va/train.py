@@ -46,7 +46,6 @@ from utils import (
 
 from dataset import MultiLatentLeRobotDataset
 import gc
-from datetime import datetime
 
 
 class Trainer:
@@ -55,7 +54,7 @@ class Trainer:
             # wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             # self.wandb = wandb
             # self.wandb.init(
-            #     # entity=os.environ["WANDB_TEAM_NAME"],
+            #     entity=os.environ["WANDB_TEAM_NAME"],
             #     project=os.getenv("WANDB_PROJECT", "va_robotwin"),
             #     # dir=log_dir,
             #     config=config,
@@ -129,8 +128,6 @@ class Trainer:
         # Setup dataloaders
         logger.info("Setting up datasets...")
         train_dataset = MultiLatentLeRobotDataset(config=config)
-        if config.rank == 0:
-            print(f"[Train] Train dataset length: {len(train_dataset)}", flush=True)
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -151,14 +148,30 @@ class Trainer:
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.save_dir = Path(config.save_root) / f"checkpoints_{timestamp}"
+        self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+        self.train_loader_iter = None
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     
+    def _get_next_batch(self):
+        """Get next batch from iterator, reset if epoch is finished."""
+        if self.train_loader_iter is None:
+            self.train_loader_iter = iter(self.train_loader)
+        
+        try:
+            batch = next(self.train_loader_iter)
+        except StopIteration:
+            # Reset sampler and iterator when epoch finishes
+            if hasattr(self.train_loader.sampler, 'set_epoch'):
+                self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
+            self.train_loader_iter = iter(self.train_loader)
+            batch = next(self.train_loader_iter)
+        
+        return batch
+
     @torch.no_grad()
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
         B, C, F, H, W = latent.shape
@@ -216,7 +229,6 @@ class Trainer:
         """Prepare input dict following infer code pattern from wan_va_server.py."""
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
-        
         latent_dict = self._add_noise(
             latent=batch_dict['latents'], 
             train_scheduler=self.train_scheduler_latent, 
@@ -233,7 +245,6 @@ class Trainer:
 
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
-        print(batch_dict['text'])
         action_dict['actions_mask'] = batch_dict['actions_mask']
 
         input_dict = {
@@ -247,8 +258,7 @@ class Trainer:
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
         for key, value in input_dict.items():
-            if isinstance(value, torch.Tensor):
-                input_dict[key] = value.to(self.device)
+            input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
     def compute_loss(self,
@@ -276,7 +286,7 @@ class Trainer:
         latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
         latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
 
-        # Frame-wise action loss calculation       
+        # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
         mask = input_dict['action_dict']['actions_mask'].float()
         raw_mse_mean = (action_loss * mask).sum() / (mask.sum() + 1e-6)
@@ -295,57 +305,165 @@ class Trainer:
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, raw_mse_mean.detach()
 
-    def train_epoch(self):
+    def _train_step(self, batch, batch_idx):
+        """Train a single batch, returns losses for logging."""
+        batch = self.convert_input_format(batch)
+        input_dict = self._prepare_input_dict(batch)
+        
+        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        
+        if not should_sync:
+            self.transformer.set_requires_gradient_sync(False)
+        else:
+            self.transformer.set_requires_gradient_sync(True)
+
+        output = self.transformer(input_dict, train_mode=True)
+        latent_loss, action_loss, raw_mse = self.compute_loss(input_dict, output)
+        loss = latent_loss + action_loss
+
+        loss.backward()
+
+        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach(), 'raw_mse': raw_mse.detach()}
+        
+        # Only update weights after accumulating gradients
+        if should_sync:
+            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            
+            losses['total_norm'] = total_norm
+            losses['should_log'] = True
+        else:
+            losses['should_log'] = False
+
+        return losses
+
+    def save_checkpoint(self,):
+        """Save model checkpoint in the same format as pretrained model."""
+        try:
+            state_dict = get_model_state_dict(
+                self.transformer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+            state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+            # optim_state = get_optimizer_state_dict(
+            #         self.transformer, self.optimizer,
+            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            #     )
+
+            # Only rank 0 saves the checkpoint
+            if self.config.rank == 0:
+                checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+                # Save transformer in the same format as pretrained model
+                transformer_dir = checkpoint_dir / "transformer"
+                transformer_dir.mkdir(parents=True, exist_ok=True)
+
+                logger.info(f"Saving transformer to {transformer_dir}")
+
+                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
+                # Save model weights
+                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+                save_file(state_dict_bf16, model_file)
+
+                # Save config (copy from original transformer config and update _name_or_path)
+                config_file = transformer_dir / "config.json"
+                config_dict = dict(self.transformer.config)
+                config_dict.pop('_name_or_path', None)
+                with open(config_file, 'w') as f:
+                    json.dump(config_dict, f, indent=2)
+
+                # # Save optimizer state and training metadata in PyTorch format
+                # training_state_path = checkpoint_dir / "training_state.pt"
+                # logger.info(f"Saving training state to {training_state_path}")
+                # torch.save({
+                #     'step': self.step,
+                #     'optimizer_state_dict': optim_state,
+                #     'config': vars(self.config),
+                # }, training_state_path)
+
+                logger.info(f"Checkpoint saved successfully at step {self.step}")
+
+            # Synchronize all processes after saving
+            if dist.is_initialized():
+                dist.barrier()
+
+        except Exception as e:
+            if self.config.rank == 0:
+                logger.error(f"Failed to save checkpoint: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+            # Ensure all processes stay synchronized even on error
+            if dist.is_initialized():
+                dist.barrier()
+
+    def _load_training_state(self, checkpoint_path):
+        """Load training state (optimizer + step) after FSDP and optimizer creation."""
+        checkpoint_dir = Path(checkpoint_path)
+        training_state_path = checkpoint_dir / "training_state.pt"
+
+        if not training_state_path.exists():
+            if self.config.rank == 0:
+                logger.warning(f"Training state not found: {training_state_path}, starting from step 0")
+            return
+
+        if self.config.rank == 0:
+            logger.info(f"Loading training state from {training_state_path}")
+
+        # All ranks load the training state directly
+        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
+
+        # All ranks load optimizer state (required for FSDP)
+        set_optimizer_state_dict(
+            self.transformer, self.optimizer,
+            optim_state_dict=training_state['optimizer_state_dict'],
+            options=StateDictOptions(full_state_dict=True, strict=False)
+        )
+        self.step = training_state.get('step', 0)
+
+        if self.config.rank == 0:
+            logger.info(f"Training state loaded, resuming from step {self.step}")
+
+        # Synchronize all ranks
+        if dist.is_initialized():
+            dist.barrier()
+
+    def train(self):
+        """Main training loop - train by steps instead of epochs."""
+        logger.info(f"Starting training for {self.config.num_steps} steps...")
         self.transformer.train()
 
-        # Use manual progress bar control to only update on optimizer steps
         progress_bar = tqdm(
-            total=len(self.train_loader),
+            total=self.config.num_steps,
             desc="Training",
             disable=(self.config.rank != 0),
             leave=True,
-            dynamic_ncols=True
+            dynamic_ncols=True,
+            initial=self.step
         )
 
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
         accumulated_raw_mse_losses = []
+        step_in_accumulation = 0
 
-        for batch_idx, batch in enumerate(self.train_loader):
-            if self.config.rank == 0:
-                episode_indices = batch.get('episode_index', None)
-                # print(f"[batch {batch_idx}] episode_index: {episode_indices}", flush=True)
-            # transfer batch to device
-            batch = self.convert_input_format(batch)
-
-            input_dict = self._prepare_input_dict(batch)
-
-            should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
+        while self.step < self.config.num_steps:
+            # Get next batch (handles epoch reset automatically)
+            batch = self._get_next_batch()
             
-            if not should_sync:
-                self.transformer.set_requires_gradient_sync(False)
-            else:
-                self.transformer.set_requires_gradient_sync(True)
-
-            output = self.transformer(input_dict, train_mode=True)
-            latent_loss, action_loss, raw_mse = self.compute_loss(input_dict, output)
-            loss = latent_loss + action_loss # Scale loss for accumulation
-
-            loss.backward()
-
+            losses = self._train_step(batch, step_in_accumulation)
+            
             # Accumulate losses for logging
-            accumulated_latent_losses.append(latent_loss.detach())
-            accumulated_action_losses.append(action_loss.detach())
-            accumulated_raw_mse_losses.append(raw_mse)
+            accumulated_latent_losses.append(losses['latent_loss'])
+            accumulated_action_losses.append(losses['action_loss'])
+            accumulated_raw_mse_losses.append(losses['raw_mse'])
+            step_in_accumulation += 1
 
-            # Only update weights after accumulating gradients
-            if should_sync:
-                total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-
+            # Log and checkpoint when optimizer steps
+            if losses['should_log']:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 # Average accumulated losses
@@ -353,12 +471,13 @@ class Trainer:
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
-                raw_mse_show = dist_mean(torch.stack(accumulated_raw_mse_losses).mean()).detach().cpu().item()
 
+                raw_mse_show = dist_mean(torch.stack(accumulated_raw_mse_losses).mean()).detach().cpu().item()
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
                 accumulated_raw_mse_losses = []
+                step_in_accumulation = 0
 
                 torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
@@ -366,7 +485,7 @@ class Trainer:
                     gc.collect()
 
                 if self.config.rank == 0:
-                    # Manually increment counter, set_postfix will refresh automatically
+                    total_norm = losses['total_norm']
                     progress_bar.n += self.gradient_accumulation_steps
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
@@ -381,29 +500,33 @@ class Trainer:
                             'loss_metrics/global_avg_action_loss': action_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
-                            'loss_metrics/action_raw_mse': raw_mse_show,
+                            'loss_metrics/global_avg_raw_mse': raw_mse_show,
                             'grad_norm': total_norm.item(),
                             'lr': lr,
                         }, step=self.step)
+                
                 self.step += 1
+                
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
-
+                
                 eval_interval = getattr(self.config, 'eval_interval', 0)
                 eval_num_samples = getattr(self.config, 'eval_num_samples', 4)
                 if eval_interval > 0 and self.step % eval_interval == 0:
-                    # 从当前 loader 收集若干 batch 做开环测试
                     eval_batches = []
                     for _b in self.train_loader:
                         eval_batches.append(_b)
                         if len(eval_batches) >= eval_num_samples:
                             break
                     self.run_open_loop_eval(eval_batches)
+            if dist.is_initialized():
+                dist.barrier()
 
         progress_bar.close()
-
+        logger.info("Training completed!")
+    
     @torch.no_grad()
     def run_open_loop_eval(self, eval_batches):
         """从训练数据取若干 batch，每个 batch 随机采样多个 4-chunk 窗口做开环测试。
@@ -529,109 +652,6 @@ class Trainer:
                 self.wandb.log({'eval/open_loop_action_mse': avg_mse}, step=log_step)
 
         self.transformer.train()
-
-    def save_checkpoint(self,):
-        """Save model checkpoint in the same format as pretrained model."""
-        try:
-            state_dict = get_model_state_dict(
-                self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            )
-            state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
-
-            # Only rank 0 saves the checkpoint
-            if self.config.rank == 0:
-                checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                # Save transformer in the same format as pretrained model
-                transformer_dir = checkpoint_dir / "transformer"
-                transformer_dir.mkdir(parents=True, exist_ok=True)
-
-                logger.info(f"Saving transformer to {transformer_dir}")
-
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
-                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
-                save_file(state_dict_bf16, model_file)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
-                config_dict = dict(self.transformer.config)
-                config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
-
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
-
-                logger.info(f"Checkpoint saved successfully at step {self.step}")
-
-            # Synchronize all processes after saving
-            if dist.is_initialized():
-                dist.barrier()
-
-        except Exception as e:
-            if self.config.rank == 0:
-                logger.error(f"Failed to save checkpoint: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
-            if dist.is_initialized():
-                dist.barrier()
-
-    def _load_training_state(self, checkpoint_path):
-        """Load training state (optimizer + step) after FSDP and optimizer creation."""
-        checkpoint_dir = Path(checkpoint_path)
-        training_state_path = checkpoint_dir / "training_state.pt"
-
-        if not training_state_path.exists():
-            if self.config.rank == 0:
-                logger.warning(f"Training state not found: {training_state_path}, starting from step 0")
-            return
-
-        if self.config.rank == 0:
-            logger.info(f"Loading training state from {training_state_path}")
-
-        # All ranks load the training state directly
-        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
-
-        # All ranks load optimizer state (required for FSDP)
-        set_optimizer_state_dict(
-            self.transformer, self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
-        )
-        self.step = training_state.get('step', 0)
-
-        if self.config.rank == 0:
-            logger.info(f"Training state loaded, resuming from step {self.step}")
-
-        # Synchronize all ranks
-        if dist.is_initialized():
-            dist.barrier()
-
-    def train(self):
-        """Main training loop."""
-        logger.info(f"Starting training for {self.config.num_steps} steps...")
-
-        while self.step < self.config.num_steps:
-            self.train_epoch()
-            if dist.is_initialized():
-                dist.barrier()
-
-        logger.info("Training completed!")
-
 
 def run(args):
     """Main entry point."""
