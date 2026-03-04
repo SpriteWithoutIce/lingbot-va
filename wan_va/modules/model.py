@@ -419,6 +419,8 @@ class WanAttention(torch.nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        return_attn_weights=False,
+        key_padding_mask=None,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -454,6 +456,19 @@ class WanAttention(torch.nn.Module):
 
         hidden_states = self.attn_op(query, key, value)
 
+        attn_probs = None
+        if return_attn_weights:
+            scale = query.shape[-1] ** -0.5
+            q32 = query.float().permute(0, 2, 1, 3)
+            k32 = key.float().permute(0, 2, 1, 3)
+            scores = torch.matmul(q32, k32.transpose(-1, -2)) * scale
+            if key_padding_mask is not None:
+                key_padding_mask = key_padding_mask.to(scores.device)
+                if key_padding_mask.dtype != torch.bool:
+                    key_padding_mask = key_padding_mask.bool()
+                scores = scores.masked_fill(~key_padding_mask[:, None, None, :], torch.finfo(scores.dtype).min)
+            attn_probs = torch.softmax(scores, dim=-1)
+
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
                 self.restore_cache(cache_name, slots)
@@ -462,6 +477,8 @@ class WanAttention(torch.nn.Module):
         hidden_states = hidden_states.type_as(query)
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
+        if return_attn_weights:
+            return hidden_states, attn_probs
         return hidden_states
 
 
@@ -520,6 +537,8 @@ class WanTransformerBlock(nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        return_cross_attn=False,
+        encoder_attention_mask=None,
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -546,12 +565,19 @@ class WanTransformerBlock(nn.Module):
         # 2. Cross-attention
         norm_hidden_states = self.norm2(
             hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(norm_hidden_states,
-                                 encoder_hidden_states,
-                                 encoder_hidden_states,
-                                 None,
-                                 update_cache=0,
-                                 cache_name=cache_name)
+        attn2_out = self.attn2(norm_hidden_states,
+                              encoder_hidden_states,
+                              encoder_hidden_states,
+                              None,
+                              update_cache=0,
+                              cache_name=cache_name,
+                              return_attn_weights=return_cross_attn,
+                              key_padding_mask=encoder_attention_mask)
+        if return_cross_attn:
+            attn_output, cross_attn_probs = attn2_out
+        else:
+            attn_output = attn2_out
+            cross_attn_probs = None
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -563,6 +589,8 @@ class WanTransformerBlock(nn.Module):
 
         hidden_states = (hidden_states.float() +
                          ff_output.float() * c_gate_msa).type_as(hidden_states)
+        if return_cross_attn:
+            return hidden_states, cross_attn_probs
         return hidden_states
 
 
@@ -805,6 +833,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_mode=False,
         train_mode=False,
         return_layer_hidden_states=False,
+        return_layer_cross_attn=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -813,6 +842,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             input_dict: dict with noisy_latents, text_emb, grid_id, timesteps.
             return_layer_hidden_states: if True, return (output, list of per-block
                 latent hidden states before norm_out/proj_out) for semantic alignment viz.
+            return_layer_cross_attn: if True, additionally return per-block cross-attention
+                probabilities with shape [B, heads, query_tokens, text_tokens].
 
         Returns:
             latent_hidden_states (or (latent_hidden_states, layer_hidden_states_list)
@@ -851,14 +882,23 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
+        encoder_attention_mask = input_dict.get("encoder_attention_mask", None)
         layer_hidden_states_list = [] if return_layer_hidden_states else None
+        layer_cross_attn_list = [] if return_layer_cross_attn else None
         for block in self.blocks:
-            latent_hidden_states = block(latent_hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=update_cache,
-                                         cache_name=cache_name)
+            block_out = block(latent_hidden_states,
+                              text_hidden_states,
+                              timestep_proj,
+                              rotary_emb,
+                              update_cache=update_cache,
+                              cache_name=cache_name,
+                              return_cross_attn=return_layer_cross_attn,
+                              encoder_attention_mask=encoder_attention_mask)
+            if return_layer_cross_attn:
+                latent_hidden_states, cross_attn_probs = block_out
+                layer_cross_attn_list.append(cross_attn_probs)
+            else:
+                latent_hidden_states = block_out
             if return_layer_hidden_states:
                 layer_hidden_states_list.append(latent_hidden_states.clone())
 
@@ -879,8 +919,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                              'b l (n c) -> b (l n) c',
                                              n=math.prod(self.patch_size))  #
 
+        if return_layer_hidden_states and return_layer_cross_attn:
+            return latent_hidden_states, layer_hidden_states_list, layer_cross_attn_list
         if return_layer_hidden_states:
             return latent_hidden_states, layer_hidden_states_list
+        if return_layer_cross_attn:
+            return latent_hidden_states, layer_cross_attn_list
         return latent_hidden_states
 
 

@@ -261,9 +261,13 @@ class VA_Server:
             input_dict['text_emb'] = torch.cat([self.prompt_embeds.to(self.dtype).clone(), self.negative_prompt_embeds.to(self.dtype).clone()], dim=0)
             input_dict['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
             input_dict['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
+            if 'encoder_attention_mask' in input_dict:
+                input_dict['encoder_attention_mask'] = input_dict['encoder_attention_mask'].repeat(2, 1)
         else:
             input_dict['grid_id'] = input_dict['grid_id'][None]
             input_dict['timesteps'] = input_dict['timesteps'][None]
+            if 'encoder_attention_mask' in input_dict:
+                input_dict['encoder_attention_mask'] = input_dict['encoder_attention_mask'][None]
         return input_dict
 
     def _prepare_latent_input(self,
@@ -292,6 +296,8 @@ class VA_Server:
                             1, frame_st_id).to(self.device),
                 'text_emb':
                 self.prompt_embeds.to(self.dtype).clone(),
+                'encoder_attention_mask':
+                (self.prompt_embeds[0].abs().sum(dim=-1) > 0),
             }
             if latent_cond is not None:
                 input_dict['latent_res_lst'][
@@ -316,6 +322,8 @@ class VA_Server:
                             action=True).to(self.device),
                 'text_emb':
                 self.prompt_embeds.to(self.dtype).clone(),
+                'encoder_attention_mask':
+                (self.prompt_embeds[0].abs().sum(dim=-1) > 0),
             }
 
             if action_cond is not None:
@@ -537,20 +545,22 @@ class VA_Server:
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
                     action_mode=False,
-                    return_layer_hidden_states=semantic_probe)
+                    return_layer_hidden_states=semantic_probe,
+                    return_layer_cross_attn=semantic_probe)
 
                 if semantic_probe:
-                    video_noise_pred, layer_hidden_states = transformer_out
+                    video_noise_pred, layer_hidden_states, layer_cross_attn = transformer_out
                     if semantic_payload["frame_hw"] is None:
                         patch_h, patch_w = self.job_config.patch_size[1], self.job_config.patch_size[2]
                         semantic_payload["frame_hw"] = [
                             self.latent_height // patch_h,
                             self.latent_width // patch_w,
                         ]
-                    semantic_probe_data = self._build_semantic_probe_data(
-                        layer_hidden_states=layer_hidden_states,
+                    semantic_probe_data = self._build_attention_probe_data(
+                        layer_cross_attn=layer_cross_attn,
                         frame_chunk_size=frame_chunk_size,
                         frame_id=int(obs.get("semantic_probe_frame_id", 0)),
+                        text_mask=input_dict['latent_res_lst']['encoder_attention_mask'],
                     )
                     semantic_payload["timesteps"].append(float(t.detach().cpu().item()))
                     semantic_payload["maps"].append(semantic_probe_data["maps"])
@@ -625,30 +635,33 @@ class VA_Server:
         torch.cuda.empty_cache()
         return actions, latents, semantic_payload
 
-    def _build_semantic_probe_data(self, layer_hidden_states, frame_chunk_size: int, frame_id: int):
+    def _build_attention_probe_data(self, layer_cross_attn, frame_chunk_size: int, frame_id: int, text_mask: torch.Tensor):
         patch_h, patch_w = self.job_config.patch_size[1], self.job_config.patch_size[2]
         h_tokens = self.latent_height // patch_h
         w_tokens = self.latent_width // patch_w
         frame_id = max(0, min(frame_chunk_size - 1, frame_id))
 
-        text_tokens = self.transformer.condition_embedder.text_embedder(self.prompt_embeds.to(self.dtype).clone())[0]
-        token_mask = self.prompt_embeds[0].abs().sum(dim=-1) > 0
-        text_feat = text_tokens[token_mask].mean(dim=0)
-        text_feat = F.normalize(text_feat.float(), dim=0)
+        valid_text = text_mask.to(dtype=torch.bool, device=self.device)
 
         maps = []
         morans_i = []
         std_vals = []
-        layer_ids = list(range(len(layer_hidden_states)))
+        layer_ids = list(range(len(layer_cross_attn)))
 
-        for hidden in layer_hidden_states:
-            hidden = hidden[0].float().reshape(frame_chunk_size, h_tokens, w_tokens, -1)
-            frame_hidden = F.normalize(hidden[frame_id], dim=-1)
-            sim = torch.einsum("hwc,c->hw", frame_hidden, text_feat)
-            sim_np = sim.detach().cpu().numpy().astype(np.float32)
-            maps.append(sim_np)
-            std_vals.append(float(np.std(sim_np)))
-            morans_i.append(float(self._morans_i_8n(sim_np)))
+        for cross_attn in layer_cross_attn:
+            # cross_attn: [B, heads, query_tokens, text_tokens]
+            attn = cross_attn[0].float()
+            attn = attn[:, :, valid_text]
+            if attn.shape[-1] == 0:
+                query_score = torch.zeros(attn.shape[1], device=attn.device, dtype=attn.dtype)
+            else:
+                # text-guided saliency: per-query max over text tokens, then average over heads
+                query_score = attn.max(dim=-1).values.mean(dim=0)
+            query_map = query_score.reshape(frame_chunk_size, h_tokens, w_tokens)[frame_id]
+            map_np = query_map.detach().cpu().numpy().astype(np.float32)
+            maps.append(map_np)
+            std_vals.append(float(np.std(map_np)))
+            morans_i.append(float(self._morans_i_8n(map_np)))
 
         return {
             "maps": np.stack(maps, axis=0),
