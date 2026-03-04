@@ -31,6 +31,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 
 import imageio
+import matplotlib.cm as cm
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -149,6 +150,9 @@ class Args:
 
     frame_chunk_size: int = 2
     action_per_frame: int = 4
+    semantic_probe: bool = False
+    semantic_probe_chunk_stride: int = 1
+    semantic_probe_frame_id: int = 0
 
 
 
@@ -163,6 +167,9 @@ def eval_libero(cfg: Args) -> None:
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     video_out_path = pathlib.Path(cfg.video_out_path) / f"{cfg.task_suite_name}_{run_timestamp}"
     video_out_path.mkdir(parents=True, exist_ok=True)
+    semantic_out_path = video_out_path / "semantic_probe"
+    if cfg.semantic_probe:
+        semantic_out_path.mkdir(parents=True, exist_ok=True)
 
     if cfg.task_suite_name == "libero_spatial":
         max_steps = 280
@@ -191,6 +198,16 @@ def eval_libero(cfg: Args) -> None:
             OBS_IMAGE_KEY: img,
             OBS_WRIST_KEY: wrist_img,
         }
+
+    def _save_semantic_overlay(base_img: np.ndarray, sim_map: np.ndarray, save_path: pathlib.Path) -> None:
+        low = sim_map.min()
+        high = sim_map.max()
+        norm = (sim_map - low) / (high - low + 1e-6)
+        heat = (cm.jet(norm)[..., :3] * 255).astype(np.uint8)
+        heat = image_tools.resize_with_pad(heat, base_img.shape[0], base_img.shape[1])
+        overlay = (0.55 * base_img.astype(np.float32) + 0.45 * heat.astype(np.float32)).clip(0, 255).astype(np.uint8)
+        imageio.imwrite(save_path, overlay)
+
     for task_id in tqdm.tqdm(range(num_tasks_in_suite), desc="task"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
@@ -225,9 +242,41 @@ def eval_libero(cfg: Args) -> None:
                         continue
                     if first:
                         first_obs = _obs_to_frame(obs)
-                    ret = client.infer(dict(obs=first_obs, prompt=task_description)) #(TASK_ENV, model, observation)
+                    infer_payload = dict(obs=first_obs, prompt=task_description)
+                    should_probe = cfg.semantic_probe and ((len(full_action_history) // max(1, cfg.action_per_frame)) % cfg.semantic_probe_chunk_stride == 0)
+                    if should_probe:
+                        infer_payload["semantic_probe"] = True
+                        infer_payload["semantic_probe_frame_id"] = cfg.semantic_probe_frame_id
+
+                    ret = client.infer(infer_payload) #(TASK_ENV, model, observation)
                     action = ret['action']
                     key_frame_list = []
+
+                    if should_probe and "semantic_probe" in ret:
+                        probe = ret["semantic_probe"]
+                        maps = np.asarray(probe["maps"])
+                        # maps: [num_steps, num_layers, h, w]
+                        if maps.ndim == 4 and maps.shape[-2] >= 2:
+                            # libero latent vertical concat: upper=wrist, lower=agent view
+                            maps_agent = maps[..., maps.shape[-2] // 2 :, :]
+                        else:
+                            maps_agent = maps
+
+                        probe_tag = f"task{task_id:02d}_ep{episode_idx:02d}_t{t:04d}"
+                        np.savez_compressed(
+                            semantic_out_path / f"{probe_tag}_metrics.npz",
+                            timesteps=np.asarray(probe["timesteps"]),
+                            layer_ids=np.asarray(probe["layer_ids"]),
+                            morans_i=np.asarray(probe["morans_i"]),
+                            std=np.asarray(probe["std"]),
+                        )
+
+                        # Save initial/middle/final denoise step overlays using the last layer map
+                        step_ids = sorted(set([0, maps_agent.shape[0] // 2, maps_agent.shape[0] - 1]))
+                        for sid in step_ids:
+                            sim_map = maps_agent[sid, -1]
+                            save_path = semantic_out_path / f"{probe_tag}_step{sid:03d}_layer_last_overlay.png"
+                            _save_semantic_overlay(first_obs[OBS_IMAGE_KEY], sim_map, save_path)
 
                     assert action.shape[2] % 4 == 0
                     action_per_frame = action.shape[2] // 4
