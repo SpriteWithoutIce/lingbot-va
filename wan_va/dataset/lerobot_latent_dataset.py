@@ -64,13 +64,23 @@ def _safe_quat(quat):
     quat = np.where(norm < 1e-8, identity, quat / np.maximum(norm, 1e-8))
     return quat.squeeze(0) if quat.shape[0] == 1 else quat
 
+def convert_action_to_quat(actions):
+    # actions: (frame_num, 7)
+    xyz = actions[:, :3]
+    rotvec = actions[:, 3:6]
+    gripper = actions[:, 6:7]
+
+    quat = R.from_rotvec(rotvec).as_quat()
+
+    new_actions = np.concatenate([xyz, quat, gripper], axis=1)
+    return new_actions
+
 def get_relative_pose(pose):
     if torch.is_tensor(pose):
         pose = pose.detach().cpu().numpy()
-    quat = _safe_quat(pose[:, 3:7])
-    first_quat = _safe_quat(pose[:1, 3:7])
-    rot = R.from_quat(quat)
-    first_rot = R.from_quat(np.tile(first_quat.reshape(1, -1), (pose.shape[0], 1)))
+    
+    rot = R.from_quat(pose[:, 3:7])
+    first_rot = R.from_quat(np.tile(pose[:1, 3:7], (pose.shape[0], 1)))
     trans = pose[:, :3]
     relative_trans = trans - trans[0:1]
 
@@ -313,9 +323,12 @@ class LatentLeRobotDataset(LeRobotDataset):
                                  h=latent_height, 
                                  w=latent_width)
             latent_lst.append(latent)
-        wrist_latent = torch.cat(latent_lst[1:], dim=2)
-        cat_latent = torch.cat([wrist_latent, latent_lst[0]], dim=1)
-
+        if self.config.env_type == 'robotwin_tshape':
+            wrist_latent = torch.cat(latent_lst[1:], dim=2)
+            cat_latent = torch.cat([wrist_latent, latent_lst[0]], dim=1)
+        else:
+            cat_latent = torch.cat(latent_lst, dim=2)
+        
         text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
         if torch.rand(1).item() < self.cfg_prob:
             text_emb = self.empty_emb
@@ -332,31 +345,14 @@ class LatentLeRobotDataset(LeRobotDataset):
         action = action[act_shift:]
         if torch.is_tensor(action):
             action = action.cpu().numpy()
-        # n = action.shape[0]
-        # if action.shape[1] == 7:
-        #     #  单臂轴角格式
-        #     from scipy.spatial.transform import Rotation as R
-        #     xyz = action[:, :3]
-        #     aa = action[:, 3:6]   # axis-angle
-        #     gripper = action[:, 6:7]
-        #     # 轴角 -> 四元数，传给 get_relative_pose
-        #     quat = R.from_rotvec(aa).as_quat()  # (n, 4) xyzw
-        #     pose7 = np.concatenate([xyz, quat], axis=1)  # (n, 7): xyz + quat
-        #     left_action = get_relative_pose(pose7)
-        #     left_gripper = gripper  # (n, 1)
-        # else:
-        #     left_action = get_relative_pose(action[:, :7])
-        #     left_gripper = action[:, 7:8]
-        # left_action = np.asarray(left_action, dtype=np.float32)
-        # if action.shape[1] >= 15:
-        #     right_action = get_relative_pose(action[:, 8:15])
-        #     right_action = np.asarray(right_action, dtype=np.float32)
-        #     right_gripper = action[:, 15:16]
-        # else:
-        #     # 单臂：右臂用零填充
-        #     right_action = np.zeros((n, 7), dtype=np.float32)
-        #     right_gripper = np.zeros((n, 1), dtype=action.dtype)
-        # action = np.concatenate([left_action, left_gripper, right_action, right_gripper], axis=1)
+        if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
+            left_action = get_relative_pose(action[:, :7])
+            right_action = get_relative_pose(action[:, 8:15])
+            action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
+        else:
+            action = convert_action_to_quat(action)
+            action = np.concatenate([get_relative_pose(action[:, :7]), action[:, 7:8]], axis=1)
+        # pad 4 actions
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
         required_action_num = latent_frame_num * frame_stride * 4
