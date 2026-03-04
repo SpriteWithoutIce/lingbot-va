@@ -233,16 +233,15 @@ def eval_libero(cfg: Args) -> None:
             t = 0
             replay_images = []
             done = False
-            first_obs = None
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     if t < cfg.num_steps_wait:
                         obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
-                    if first:
-                        first_obs = _obs_to_frame(obs)
-                    infer_payload = dict(obs=first_obs, prompt=task_description)
+
+                    current_obs = _obs_to_frame(obs)
+                    infer_payload = dict(obs=current_obs, prompt=task_description)
                     should_probe = cfg.semantic_probe and ((len(full_action_history) // max(1, cfg.action_per_frame)) % cfg.semantic_probe_chunk_stride == 0)
                     if should_probe:
                         infer_payload["semantic_probe"] = True
@@ -255,28 +254,33 @@ def eval_libero(cfg: Args) -> None:
                     if should_probe and "semantic_probe" in ret:
                         probe = ret["semantic_probe"]
                         maps = np.asarray(probe["maps"])
-                        # maps: [num_steps, num_layers, h, w]
+                        # maps: [num_denoise_steps, num_layers, h, w]
                         if maps.ndim == 4 and maps.shape[-2] >= 2:
                             # libero latent vertical concat: upper=wrist, lower=agent view
                             maps_agent = maps[..., maps.shape[-2] // 2 :, :]
                         else:
                             maps_agent = maps
 
-                        probe_tag = f"task{task_id:02d}_ep{episode_idx:02d}_t{t:04d}"
+                        probe_tag = f"task{task_id:02d}_ep{episode_idx:02d}_envstep{t:04d}"
+                        step_ids = sorted(set([0, maps_agent.shape[0] // 2, maps_agent.shape[0] - 1]))
                         np.savez_compressed(
                             semantic_out_path / f"{probe_tag}_metrics.npz",
+                            env_step=t,
+                            denoise_step_ids=np.asarray(step_ids, dtype=np.int32),
                             timesteps=np.asarray(probe["timesteps"]),
                             layer_ids=np.asarray(probe["layer_ids"]),
                             morans_i=np.asarray(probe["morans_i"]),
                             std=np.asarray(probe["std"]),
                         )
 
-                        # Save initial/middle/final denoise step overlays using the last layer map
-                        step_ids = sorted(set([0, maps_agent.shape[0] // 2, maps_agent.shape[0] - 1]))
+                        # Save initial/middle/final denoise step overlays using the last layer map.
+                        # File name convention:
+                        #   envstep = env control step index when this chunk starts.
+                        #   denoisestep = index inside the diffusion denoising trajectory.
                         for sid in step_ids:
                             sim_map = maps_agent[sid, -1]
-                            save_path = semantic_out_path / f"{probe_tag}_step{sid:03d}_layer_last_overlay.png"
-                            _save_semantic_overlay(first_obs[OBS_IMAGE_KEY], sim_map, save_path)
+                            save_path = semantic_out_path / f"{probe_tag}_denoisestep{sid:03d}_layer_last_overlay.png"
+                            _save_semantic_overlay(current_obs[OBS_IMAGE_KEY], sim_map, save_path)
 
                     assert action.shape[2] % 4 == 0
                     action_per_frame = action.shape[2] // 4
