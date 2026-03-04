@@ -8,16 +8,16 @@
 
 cd "$(dirname "$0")/../.."
 
-START_PORT=${START_PORT:-29538}
-MASTER_PORT=${MASTER_PORT:-29563}
-CKPT=${CKPT:-/train_out/libero_all_posttrain/checkpoints_20260301_131705/checkpoint_step_750}
+START_PORT=${START_PORT:-29537}
+MASTER_PORT=${MASTER_PORT:-29564}
+CKPT=${CKPT:-/home/jwhe/linyihan/lingbot-va/train_out/libero_all_posttrain/checkpoints_20260301_131705/checkpoint_step_1000}
 SAVE_ROOT=${SAVE_ROOT:-./evaluation/libero_eval/server_out}
 mkdir -p "$SAVE_ROOT"
 
 # EXTRA_ARGS=()
 # [[ -n "${CKPT:-}" ]] && EXTRA_ARGS+=(--ckpt "$CKPT")
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2} python -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3} python -m torch.distributed.run \
     --nproc_per_node 1 \
     --master_port "$MASTER_PORT" \
     wan_va/wan_va_server.py \

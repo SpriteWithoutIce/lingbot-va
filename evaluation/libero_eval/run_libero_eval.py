@@ -37,6 +37,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from . import image_tools
 from .websocket_client_policy import WebsocketClientPolicy
+from .geometry import euler2quat
 
 # Server obs keys (must match wan_va config obs_cam_keys for libero_spatial)
 OBS_IMAGE_KEY = "observation.images.image"
@@ -190,7 +191,6 @@ def eval_libero(cfg: Args) -> None:
             OBS_IMAGE_KEY: img,
             OBS_WRIST_KEY: wrist_img,
         }
-    
     for task_id in tqdm.tqdm(range(num_tasks_in_suite), desc="task"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
@@ -198,7 +198,6 @@ def eval_libero(cfg: Args) -> None:
             task, LIBERO_ENV_RESOLUTION, cfg.seed
         )
         task_description = str(task_description)
-
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(
             range(cfg.num_trials_per_task), desc="episode", leave=False
@@ -241,6 +240,7 @@ def eval_libero(cfg: Args) -> None:
                             full_action_history.append(raw_action_step)
                             ee_action = action[:, i, j]
                             ee_action = ee_action[:7]
+                            # ee_action = np.concatenate([ee_action[:3], euler2quat(ee_action[3], ee_action[4], ee_action[5]), ee_action[6:]], axis=0)
                             ee_action = normalize_gripper_action(ee_action)
                             ee_action[..., -1] *= -1.0
                             obs, _, done, _ = env.step(ee_action)
@@ -263,7 +263,6 @@ def eval_libero(cfg: Args) -> None:
 
             task_episodes += 1
             total_episodes += 1
-
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             episode_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

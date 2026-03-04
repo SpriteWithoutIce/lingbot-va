@@ -804,25 +804,19 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
+        return_layer_hidden_states=False,
     ):
         r"""
         Forward pass through the diffusion model
 
         Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
+            input_dict: dict with noisy_latents, text_emb, grid_id, timesteps.
+            return_layer_hidden_states: if True, return (output, list of per-block
+                latent hidden states before norm_out/proj_out) for semantic alignment viz.
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            latent_hidden_states (or (latent_hidden_states, layer_hidden_states_list)
+            when return_layer_hidden_states=True).
         """
         if train_mode:
             return self.forward_train(input_dict)
@@ -857,6 +851,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
+        layer_hidden_states_list = [] if return_layer_hidden_states else None
         for block in self.blocks:
             latent_hidden_states = block(latent_hidden_states,
                                          text_hidden_states,
@@ -864,6 +859,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                          rotary_emb,
                                          update_cache=update_cache,
                                          cache_name=cache_name)
+            if return_layer_hidden_states:
+                layer_hidden_states_list.append(latent_hidden_states.clone())
+
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -881,6 +879,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                              'b l (n c) -> b (l n) c',
                                              n=math.prod(self.patch_size))  #
 
+        if return_layer_hidden_states:
+            return latent_hidden_states, layer_hidden_states_list
         return latent_hidden_states
 
 
