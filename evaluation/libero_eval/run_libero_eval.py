@@ -305,7 +305,7 @@ def eval_libero(cfg: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             episode_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = video_out_path / f"rollout_{task_segment}_{suffix}_{episode_timestamp}.mp4"
+            out_path = video_out_path / f"task{task_id:02d}_{task_segment}_{suffix}_{episode_timestamp}.mp4"
             try:
                 imageio.mimwrite(
                     out_path,

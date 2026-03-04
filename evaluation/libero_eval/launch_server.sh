@@ -17,11 +17,11 @@ mkdir -p "$SAVE_ROOT"
 # EXTRA_ARGS=()
 # [[ -n "${CKPT:-}" ]] && EXTRA_ARGS+=(--ckpt "$CKPT")
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3} python -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python -m torch.distributed.run \
     --nproc_per_node 1 \
     --master_port "$MASTER_PORT" \
     wan_va/wan_va_server.py \
-    --config-name libero_all \
+    --config-name libero_spatial \
     --port "$START_PORT" \
     --save_root "${SAVE_ROOT:-}" \
-    --ckpt "$CKPT"
+    --ckpt "$CKPT" \

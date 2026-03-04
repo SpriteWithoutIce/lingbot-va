@@ -6,12 +6,12 @@
 
 cd "$(dirname "$0")/../.."
 
-TASK_SUITE=${1:-libero_10}
+TASK_SUITE=${1:-libero_spatial}
 PORT=${2:-29537}
 REPLAN_STEPS=${REPLAN_STEPS:-10}
 VIDEO_OUT=${VIDEO_OUT:-data/libero}
 
-LOGFILE=logs/eval_libero-10_$(date +"%Y%m%d_%H%M%S").log
+LOGFILE=logs/eval_libero-object_$(date +"%Y%m%d_%H%M%S").log
 
 # LIBERO env (conda with libero installed) must be active for client
 python -m evaluation.libero_eval.run_libero_eval \
@@ -19,5 +19,5 @@ python -m evaluation.libero_eval.run_libero_eval \
     --port "$PORT" \
     --task_suite_name "$TASK_SUITE" \
     --video_out_path "$VIDEO_OUT" \
-    # --run_semantic_viz_with_obs
+    --semantic_probe \
     # > ${LOGFILE} 2>&1
