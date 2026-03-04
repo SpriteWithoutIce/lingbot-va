@@ -642,6 +642,10 @@ class VA_Server:
         frame_id = max(0, min(frame_chunk_size - 1, frame_id))
 
         valid_text = text_mask.to(dtype=torch.bool, device=self.device)
+        if valid_text.ndim > 1:
+            # Support [B, T] masks from repeated/collated paths; use the first sample.
+            valid_text = valid_text[0]
+        valid_text = valid_text.reshape(-1)
 
         maps = []
         morans_i = []
@@ -650,8 +654,15 @@ class VA_Server:
 
         for cross_attn in layer_cross_attn:
             # cross_attn: [B, heads, query_tokens, text_tokens]
-            attn = cross_attn[0].float()
-            attn = attn[:, :, valid_text]
+            attn = cross_attn[0].float()  # [heads, query_tokens, text_tokens]
+            # Guard against text-length mismatch (e.g., different padding paths across tasks).
+            if valid_text.numel() != attn.shape[-1]:
+                min_t = min(valid_text.numel(), attn.shape[-1])
+                attn = attn[:, :, :min_t]
+                valid_text_local = valid_text[:min_t]
+            else:
+                valid_text_local = valid_text
+            attn = attn[:, :, valid_text_local]
             if attn.shape[-1] == 0:
                 query_score = torch.zeros(attn.shape[1], device=attn.device, dtype=attn.dtype)
             else:
