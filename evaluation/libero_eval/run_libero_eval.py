@@ -262,25 +262,11 @@ def eval_libero(cfg: Args) -> None:
                             maps_agent = maps
 
                         probe_tag = f"task{task_id:02d}_ep{episode_idx:02d}_envstep{t:04d}"
-                        step_ids = sorted(set([0, maps_agent.shape[0] // 2, maps_agent.shape[0] - 1]))
-                        np.savez_compressed(
-                            semantic_out_path / f"{probe_tag}_metrics.npz",
-                            env_step=t,
-                            denoise_step_ids=np.asarray(step_ids, dtype=np.int32),
-                            timesteps=np.asarray(probe["timesteps"]),
-                            layer_ids=np.asarray(probe["layer_ids"]),
-                            morans_i=np.asarray(probe["morans_i"]),
-                            std=np.asarray(probe["std"]),
-                        )
-
-                        # Save initial/middle/final denoise step overlays using the last layer map.
-                        # File name convention:
-                        #   envstep = env control step index when this chunk starts.
-                        #   denoisestep = index inside the diffusion denoising trajectory.
-                        for sid in step_ids:
-                            sim_map = maps_agent[sid, -1]
-                            save_path = semantic_out_path / f"{probe_tag}_denoisestep{sid:03d}_layer_last_overlay.png"
-                            _save_semantic_overlay(current_obs[OBS_IMAGE_KEY], sim_map, save_path)
+                        # Only save the final denoising-step overlay (e.g. step 19 when num_steps=20).
+                        sid = maps_agent.shape[0] - 1
+                        sim_map = maps_agent[sid, -1]
+                        save_path = semantic_out_path / f"{probe_tag}_denoisestep{sid:03d}_layer_last_overlay.png"
+                        _save_semantic_overlay(current_obs[OBS_IMAGE_KEY], sim_map, save_path)
 
                     assert action.shape[2] % 4 == 0
                     action_per_frame = action.shape[2] // 4
