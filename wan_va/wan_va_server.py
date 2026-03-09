@@ -261,9 +261,13 @@ class VA_Server:
             input_dict['text_emb'] = torch.cat([self.prompt_embeds.to(self.dtype).clone(), self.negative_prompt_embeds.to(self.dtype).clone()], dim=0)
             input_dict['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
             input_dict['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
+            if 'encoder_attention_mask' in input_dict:
+                input_dict['encoder_attention_mask'] = input_dict['encoder_attention_mask'].repeat(2, 1)
         else:
             input_dict['grid_id'] = input_dict['grid_id'][None]
             input_dict['timesteps'] = input_dict['timesteps'][None]
+            if 'encoder_attention_mask' in input_dict:
+                input_dict['encoder_attention_mask'] = input_dict['encoder_attention_mask'][None]
         return input_dict
 
     def _prepare_latent_input(self,
@@ -292,6 +296,8 @@ class VA_Server:
                             1, frame_st_id).to(self.device),
                 'text_emb':
                 self.prompt_embeds.to(self.dtype).clone(),
+                'encoder_attention_mask':
+                (self.prompt_embeds[0].abs().sum(dim=-1) > 0),
             }
             if latent_cond is not None:
                 input_dict['latent_res_lst'][
@@ -316,6 +322,8 @@ class VA_Server:
                             action=True).to(self.device),
                 'text_emb':
                 self.prompt_embeds.to(self.dtype).clone(),
+                'encoder_attention_mask':
+                (self.prompt_embeds[0].abs().sum(dim=-1) > 0),
             }
 
             if action_cond is not None:
@@ -505,6 +513,16 @@ class VA_Server:
             mode='constant',
             value=0)
 
+        semantic_probe = bool(obs.get("semantic_probe", False))
+        semantic_payload = {
+            "timesteps": [],
+            "maps": [],
+            "morans_i": [],
+            "std": [],
+            "frame_hw": None,
+            "layer_ids": [],
+        } if semantic_probe else None
+
         with (
                 torch.no_grad(),
         ):
@@ -522,11 +540,35 @@ class VA_Server:
                     None,
                     frame_st_id=frame_st_id)
 
-                video_noise_pred = self.transformer(
+                transformer_out = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
-                    action_mode=False)
+                    action_mode=False,
+                    return_layer_hidden_states=semantic_probe,
+                    return_layer_cross_attn=semantic_probe)
+
+                if semantic_probe:
+                    video_noise_pred, layer_hidden_states, layer_cross_attn = transformer_out
+                    if semantic_payload["frame_hw"] is None:
+                        patch_h, patch_w = self.job_config.patch_size[1], self.job_config.patch_size[2]
+                        semantic_payload["frame_hw"] = [
+                            self.latent_height // patch_h,
+                            self.latent_width // patch_w,
+                        ]
+                    semantic_probe_data = self._build_attention_probe_data(
+                        layer_cross_attn=layer_cross_attn,
+                        frame_chunk_size=frame_chunk_size,
+                        frame_id=int(obs.get("semantic_probe_frame_id", 0)),
+                        text_mask=input_dict['latent_res_lst']['encoder_attention_mask'],
+                    )
+                    semantic_payload["timesteps"].append(float(t.detach().cpu().item()))
+                    semantic_payload["maps"].append(semantic_probe_data["maps"])
+                    semantic_payload["morans_i"].append(semantic_probe_data["morans_i"])
+                    semantic_payload["std"].append(semantic_probe_data["std"])
+                    semantic_payload["layer_ids"] = semantic_probe_data["layer_ids"]
+                else:
+                    video_noise_pred = transformer_out
 
                 if not last_step or video_step != -1:
                     video_noise_pred = data_seq_to_patch(
@@ -591,7 +633,81 @@ class VA_Server:
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
-        return actions, latents
+        return actions, latents, semantic_payload
+
+    def _build_attention_probe_data(self, layer_cross_attn, frame_chunk_size: int, frame_id: int, text_mask: torch.Tensor):
+        patch_h, patch_w = self.job_config.patch_size[1], self.job_config.patch_size[2]
+        h_tokens = self.latent_height // patch_h
+        w_tokens = self.latent_width // patch_w
+        frame_id = max(0, min(frame_chunk_size - 1, frame_id))
+
+        valid_text = text_mask.to(dtype=torch.bool, device=self.device)
+        if valid_text.ndim > 1:
+            # Support [B, T] masks from repeated/collated paths; use the first sample.
+            valid_text = valid_text[0]
+        valid_text = valid_text.reshape(-1)
+
+        maps = []
+        morans_i = []
+        std_vals = []
+        layer_ids = list(range(len(layer_cross_attn)))
+
+        for cross_attn in layer_cross_attn:
+            # cross_attn: [B, heads, query_tokens, text_tokens]
+            attn = cross_attn[0].float()  # [heads, query_tokens, text_tokens]
+            # Guard against text-length mismatch (e.g., different padding paths across tasks).
+            if valid_text.numel() != attn.shape[-1]:
+                min_t = min(valid_text.numel(), attn.shape[-1])
+                attn = attn[:, :, :min_t]
+                valid_text_local = valid_text[:min_t]
+            else:
+                valid_text_local = valid_text
+            attn = attn[:, :, valid_text_local]
+            if attn.shape[-1] == 0:
+                query_score = torch.zeros(attn.shape[1], device=attn.device, dtype=attn.dtype)
+            else:
+                # text-guided saliency: per-query max over text tokens, then average over heads
+                query_score = attn.max(dim=-1).values.mean(dim=0)
+            query_map = query_score.reshape(frame_chunk_size, h_tokens, w_tokens)[frame_id]
+            map_np = query_map.detach().cpu().numpy().astype(np.float32)
+            maps.append(map_np)
+            std_vals.append(float(np.std(map_np)))
+            morans_i.append(float(self._morans_i_8n(map_np)))
+
+        return {
+            "maps": np.stack(maps, axis=0),
+            "morans_i": np.asarray(morans_i, dtype=np.float32),
+            "std": np.asarray(std_vals, dtype=np.float32),
+            "layer_ids": np.asarray(layer_ids, dtype=np.int32),
+        }
+
+    @staticmethod
+    def _morans_i_8n(attn_map: np.ndarray) -> float:
+        h, w = attn_map.shape
+        x = attn_map
+        x_bar = float(x.mean())
+        diff = x - x_bar
+        denom = float(np.sum(diff**2))
+        if denom < 1e-8:
+            return 0.0
+
+        numer = 0.0
+        weights = 0
+        for i in range(h):
+            for j in range(w):
+                center = diff[i, j]
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        if di == 0 and dj == 0:
+                            continue
+                        ni, nj = i + di, j + dj
+                        if 0 <= ni < h and 0 <= nj < w:
+                            numer += center * diff[ni, nj]
+                            weights += 1
+        if weights == 0:
+            return 0.0
+        n = h * w
+        return (n / weights) * (numer / denom)
 
     def _compute_kv_cache(self, obs):
         self.transformer.clear_pred_cache(self.cache_name)
@@ -645,8 +761,11 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+            action, _, semantic_payload = self._infer(obs, frame_st_id=self.frame_st_id)
+            out = dict(action=action)
+            if semantic_payload is not None:
+                out["semantic_probe"] = semantic_payload
+            return out
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -677,7 +796,7 @@ class VA_Server:
         pred_latent_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents, _ = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)

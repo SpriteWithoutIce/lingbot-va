@@ -8,9 +8,9 @@
 
 cd "$(dirname "$0")/../.."
 
-START_PORT=${START_PORT:-29537}
+START_PORT=${START_PORT:-29531}
 MASTER_PORT=${MASTER_PORT:-29564}
-CKPT=${CKPT:-/home/jwhe/linyihan/lingbot-va/train_out/libero_all_posttrain/checkpoints_20260301_131705/checkpoint_step_1000}
+CKPT=${CKPT:-/home/jwhe/linyihan/lingbot-va/train_out/libero_all_posttrain/checkpoints_20260308_000825/checkpoint_step_1000}
 SAVE_ROOT=${SAVE_ROOT:-./evaluation/libero_eval/server_out}
 mkdir -p "$SAVE_ROOT"
 
@@ -24,4 +24,4 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3} python -m torch.distributed.run 
     --config-name libero_all \
     --port "$START_PORT" \
     --save_root "${SAVE_ROOT:-}" \
-    --ckpt "$CKPT"
+    --ckpt "$CKPT" \

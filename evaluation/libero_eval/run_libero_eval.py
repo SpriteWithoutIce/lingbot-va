@@ -31,6 +31,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 
 import imageio
+import matplotlib.cm as cm
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -149,8 +150,46 @@ class Args:
 
     frame_chunk_size: int = 2
     action_per_frame: int = 4
+    semantic_probe: bool = False
+    semantic_probe_chunk_stride: int = 1
+    semantic_probe_frame_id: int = 0
 
+from scipy.spatial.transform import Rotation as R
+def add_eef_pose(rel_pose, init_pose):
+    """
+    rel_pose:  (8,)  [dxyz, q_rel, gripper]
+    init_pose: (7,)  [xyz0, quat0]
+    """
 
+    dxyz = rel_pose[:3]
+    q_rel = rel_pose[3:7]
+    gripper = rel_pose[7:8]
+
+    xyz0 = init_pose[:3]
+    q0 = init_pose[3:7]
+
+    R0 = R.from_quat(q0)
+    R_rel = R.from_quat(q_rel)
+
+    xyz = xyz0 + dxyz
+    quat = (R0 * R_rel).as_quat()
+
+    return np.concatenate([xyz, quat, gripper])
+
+def add_init_pose(new_pose, init_pose):
+    left_pose = add_eef_pose(new_pose, init_pose)
+    return left_pose
+
+def convert_quat_to_rotvec(action):
+    # action: (8,)
+    xyz = action[:3]
+    quat = action[3:7]
+    gripper = action[7:]
+
+    rotvec = R.from_quat(quat).as_rotvec()
+
+    new_action = np.concatenate([xyz, rotvec, gripper])
+    return new_action
 
 def eval_libero(cfg: Args) -> None:
     np.random.seed(cfg.seed)
@@ -163,6 +202,9 @@ def eval_libero(cfg: Args) -> None:
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     video_out_path = pathlib.Path(cfg.video_out_path) / f"{cfg.task_suite_name}_{run_timestamp}"
     video_out_path.mkdir(parents=True, exist_ok=True)
+    semantic_out_path = video_out_path / "semantic_probe"
+    if cfg.semantic_probe:
+        semantic_out_path.mkdir(parents=True, exist_ok=True)
 
     if cfg.task_suite_name == "libero_spatial":
         max_steps = 280
@@ -191,6 +233,16 @@ def eval_libero(cfg: Args) -> None:
             OBS_IMAGE_KEY: img,
             OBS_WRIST_KEY: wrist_img,
         }
+
+    def _save_semantic_overlay(base_img: np.ndarray, sim_map: np.ndarray, save_path: pathlib.Path) -> None:
+        low = sim_map.min()
+        high = sim_map.max()
+        norm = (sim_map - low) / (high - low + 1e-6)
+        heat = (cm.jet(norm)[..., :3] * 255).astype(np.uint8)
+        heat = image_tools.resize_with_pad(heat, base_img.shape[0], base_img.shape[1])
+        overlay = (0.55 * base_img.astype(np.float32) + 0.45 * heat.astype(np.float32)).clip(0, 255).astype(np.uint8)
+        imageio.imwrite(save_path, overlay)
+
     for task_id in tqdm.tqdm(range(num_tasks_in_suite), desc="task"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
@@ -216,18 +268,40 @@ def eval_libero(cfg: Args) -> None:
             t = 0
             replay_images = []
             done = False
-            first_obs = None
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     if t < cfg.num_steps_wait:
-                        obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
+                        inint_eef_pose = np.concatenate([obs['robot0_eef_pos'], obs['robot0_eef_quat']], axis=-1)
                         continue
-                    if first:
-                        first_obs = _obs_to_frame(obs)
-                    ret = client.infer(dict(obs=first_obs, prompt=task_description)) #(TASK_ENV, model, observation)
+                    current_obs = _obs_to_frame(obs)
+                    infer_payload = dict(obs=current_obs, prompt=task_description)
+                    should_probe = cfg.semantic_probe and ((len(full_action_history) // max(1, cfg.action_per_frame)) % cfg.semantic_probe_chunk_stride == 0)
+                    if should_probe:
+                        infer_payload["semantic_probe"] = True
+                        infer_payload["semantic_probe_frame_id"] = cfg.semantic_probe_frame_id
+
+                    ret = client.infer(infer_payload) #(TASK_ENV, model, observation)
                     action = ret['action']
                     key_frame_list = []
+
+                    if should_probe and "semantic_probe" in ret:
+                        probe = ret["semantic_probe"]
+                        maps = np.asarray(probe["maps"])
+                        # maps: [num_denoise_steps, num_layers, h, w]
+                        if maps.ndim == 4 and maps.shape[-2] >= 2:
+                            # libero latent vertical concat: upper=wrist, lower=agent view
+                            maps_agent = maps[..., maps.shape[-2] // 2 :, :]
+                        else:
+                            maps_agent = maps
+
+                        probe_tag = f"task{task_id:02d}_ep{episode_idx:02d}_envstep{t:04d}"
+                        # Only save the final denoising-step overlay (e.g. step 19 when num_steps=20).
+                        sid = maps_agent.shape[0] - 1
+                        sim_map = maps_agent[sid, -1]
+                        save_path = semantic_out_path / f"{probe_tag}_denoisestep{sid:03d}_layer_last_overlay.png"
+                        _save_semantic_overlay(current_obs[OBS_IMAGE_KEY], sim_map, save_path)
 
                     assert action.shape[2] % 4 == 0
                     action_per_frame = action.shape[2] // 4
@@ -240,9 +314,10 @@ def eval_libero(cfg: Args) -> None:
                             full_action_history.append(raw_action_step)
                             ee_action = action[:, i, j]
                             ee_action = ee_action[:7]
-                            # ee_action = np.concatenate([ee_action[:3], euler2quat(ee_action[3], ee_action[4], ee_action[5]), ee_action[6:]], axis=0)
+                            # ee_action = convert_quat_to_rotvec(ee_action)
                             ee_action = normalize_gripper_action(ee_action)
                             ee_action[..., -1] *= -1.0
+                            # print(ee_action)
                             obs, _, done, _ = env.step(ee_action)
                             if (j+1) % action_per_frame == 0:
                                 key_frame_list.append(_obs_to_frame(obs))
@@ -266,7 +341,7 @@ def eval_libero(cfg: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             episode_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = video_out_path / f"rollout_{task_segment}_{suffix}_{episode_timestamp}.mp4"
+            out_path = video_out_path / f"task{task_id:02d}_{task_segment}_{suffix}_{episode_timestamp}.mp4"
             try:
                 imageio.mimwrite(
                     out_path,
