@@ -46,6 +46,7 @@ from utils import (
 
 from dataset import MultiLatentLeRobotDataset
 import gc
+from datetime import datetime
 
 
 class Trainer:
@@ -148,7 +149,8 @@ class Trainer:
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
-        self.save_dir = Path(config.save_root) / "checkpoints"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_dir = Path(config.save_root) / f"checkpoints_{timestamp}"
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
@@ -670,6 +672,9 @@ def run(args):
     if args.save_root is not None:
         config.save_root = args.save_root
 
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
+
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
@@ -692,6 +697,12 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume from (e.g. .../checkpoint_step_1000)",
     )
 
     args = parser.parse_args()

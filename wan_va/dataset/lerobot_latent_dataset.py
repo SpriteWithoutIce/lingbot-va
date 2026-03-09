@@ -349,9 +349,9 @@ class LatentLeRobotDataset(LeRobotDataset):
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        else:
-            action = convert_action_to_quat(action)
-            action = np.concatenate([get_relative_pose(action[:, :7]), action[:, 7:8]], axis=1)
+        # else:
+        #     action = convert_action_to_quat(action)
+            # action = np.concatenate([get_relative_pose(action[:, :7]), action[:, 7:8]], axis=1)
         # pad 4 actions
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1

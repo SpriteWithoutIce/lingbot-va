@@ -154,7 +154,42 @@ class Args:
     semantic_probe_chunk_stride: int = 1
     semantic_probe_frame_id: int = 0
 
+from scipy.spatial.transform import Rotation as R
+def add_eef_pose(rel_pose, init_pose):
+    """
+    rel_pose:  (8,)  [dxyz, q_rel, gripper]
+    init_pose: (7,)  [xyz0, quat0]
+    """
 
+    dxyz = rel_pose[:3]
+    q_rel = rel_pose[3:7]
+    gripper = rel_pose[7:8]
+
+    xyz0 = init_pose[:3]
+    q0 = init_pose[3:7]
+
+    R0 = R.from_quat(q0)
+    R_rel = R.from_quat(q_rel)
+
+    xyz = xyz0 + dxyz
+    quat = (R0 * R_rel).as_quat()
+
+    return np.concatenate([xyz, quat, gripper])
+
+def add_init_pose(new_pose, init_pose):
+    left_pose = add_eef_pose(new_pose, init_pose)
+    return left_pose
+
+def convert_quat_to_rotvec(action):
+    # action: (8,)
+    xyz = action[:3]
+    quat = action[3:7]
+    gripper = action[7:]
+
+    rotvec = R.from_quat(quat).as_rotvec()
+
+    new_action = np.concatenate([xyz, rotvec, gripper])
+    return new_action
 
 def eval_libero(cfg: Args) -> None:
     np.random.seed(cfg.seed)
@@ -236,10 +271,10 @@ def eval_libero(cfg: Args) -> None:
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     if t < cfg.num_steps_wait:
-                        obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
+                        inint_eef_pose = np.concatenate([obs['robot0_eef_pos'], obs['robot0_eef_quat']], axis=-1)
                         continue
-
                     current_obs = _obs_to_frame(obs)
                     infer_payload = dict(obs=current_obs, prompt=task_description)
                     should_probe = cfg.semantic_probe and ((len(full_action_history) // max(1, cfg.action_per_frame)) % cfg.semantic_probe_chunk_stride == 0)
@@ -279,9 +314,10 @@ def eval_libero(cfg: Args) -> None:
                             full_action_history.append(raw_action_step)
                             ee_action = action[:, i, j]
                             ee_action = ee_action[:7]
-                            # ee_action = np.concatenate([ee_action[:3], euler2quat(ee_action[3], ee_action[4], ee_action[5]), ee_action[6:]], axis=0)
+                            # ee_action = convert_quat_to_rotvec(ee_action)
                             ee_action = normalize_gripper_action(ee_action)
                             ee_action[..., -1] *= -1.0
+                            # print(ee_action)
                             obs, _, done, _ = env.step(ee_action)
                             if (j+1) % action_per_frame == 0:
                                 key_frame_list.append(_obs_to_frame(obs))
