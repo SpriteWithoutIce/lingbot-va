@@ -39,22 +39,26 @@ class WebsocketClientPolicy:
     #             time.sleep(5)
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
-        logging.info(f"Waiting for server at {self._uri}...")
         while True:
             try:
+                print(f"[WebsocketClient] Connecting to {self._uri} ...", flush=True)
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
-                # 禁用 ping 机制，防止推理时间过长导致超时
+                # open_timeout 避免首次连接无响应时无限阻塞
                 conn = websockets.sync.client.connect(
-                    self._uri, 
-                    compression=None, 
-                    max_size=None, 
+                    self._uri,
+                    open_timeout=15,
+                    close_timeout=10,
+                    compression=None,
+                    max_size=None,
                     additional_headers=headers,
-                    ping_interval=None, 
-                    close_timeout=10
+                    ping_interval=None,
                 )
+                print(f"[WebsocketClient] TCP connected, waiting for server metadata ...", flush=True)
                 metadata = unpackb(conn.recv())
+                print(f"[WebsocketClient] Got metadata, connected.", flush=True)
                 return conn, metadata
             except (ConnectionRefusedError, Exception) as e:
+                print(f"[WebsocketClient] Not ready: {e}. Retry in 5s ...", flush=True)
                 logging.info(f"Still waiting for server... (Error: {e})")
                 time.sleep(5)
 

@@ -6,7 +6,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+# RoboTwin 仓库根目录：环境变量 ROBOTWIN_ROOT 指定，否则用默认占位（需在 launch_client 里 export）
+robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", "/home/jwhe/linyihan/RoboTwin"))
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -381,7 +382,9 @@ def main(usr_args):
     print("\033[94mEmbodiment Config:\033[0m " + embodiment_name)
     print("\n==================================")
 
+    print(f"[Client] Loading task env: {args['task_name']} ...")
     TASK_ENV = class_decorator(args["task_name"])
+    print(f"[Client] Task env ready. Connecting to policy server at {usr_args.get('host', '127.0.0.1')}:{usr_args['port']} ...")
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
@@ -393,7 +396,9 @@ def main(usr_args):
     test_num = usr_args["test_num"]
 
     
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    host = usr_args.get('host', '127.0.0.1')
+    model = WebsocketClientPolicy(host=host, port=usr_args['port'])
+    print("[Client] Connected to server. Starting evaluation ...")
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -689,8 +694,9 @@ def parse_args_and_config():
 
 
 if __name__ == "__main__":
-    
-    Sapien_TEST()
+    # 无头环境可设 ROBOTWIN_SKIP_RENDER_TEST=1 跳过渲染自检；或使用 xvfb-run 虚拟显示
+    if not os.environ.get("ROBOTWIN_SKIP_RENDER_TEST"):
+        Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
 

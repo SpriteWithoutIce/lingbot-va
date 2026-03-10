@@ -6,7 +6,7 @@
 
 cd "$(dirname "$0")/../.."
 
-TASK_SUITE=${1:-libero_10}
+TASK_SUITE=${1:-libero_spatial}
 PORT=${2:-29531}
 REPLAN_STEPS=${REPLAN_STEPS:-10}
 VIDEO_OUT=${VIDEO_OUT:-data/libero}
@@ -19,5 +19,5 @@ python -m evaluation.libero_eval.run_libero_eval \
     --port "$PORT" \
     --task_suite_name "$TASK_SUITE" \
     --video_out_path "$VIDEO_OUT" \
-    --semantic_probe \
+    # --semantic_probe \
     # > ${LOGFILE} 2>&1

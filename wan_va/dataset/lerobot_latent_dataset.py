@@ -233,7 +233,6 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
-        expected_tokens = None
         for key in self.used_video_keys:
             cur_path = latent_path / key
             latent_file = (
@@ -241,7 +240,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             )
             if not os.path.exists(latent_file):
                 return False
-            # 校验各摄像头的 latent 实际 token 数与元数据一致，且互相匹配
+            # 仅校验该视角下 latent 实际 token 数与文件内元数据一致（不同视角如 wrist 可分辨率更小、token 更少）
             try:
                 data = torch.load(latent_file, weights_only=False, map_location='cpu')
                 actual_tokens = data["latent"].shape[0]
@@ -254,16 +253,6 @@ class LatentLeRobotDataset(LeRobotDataset):
                     print(
                         f"[_check_meta] skip ep={episode_index} key={key}: "
                         f"latent shape {actual_tokens} != claimed {claimed_tokens}",
-                        flush=True,
-                    )
-                    return False
-                if expected_tokens is None:
-                    expected_tokens = actual_tokens
-                elif actual_tokens != expected_tokens:
-                    print(
-                        f"[_check_meta] skip ep={episode_index} key={key}: "
-                        f"latent token mismatch across cameras "
-                        f"({actual_tokens} vs {expected_tokens})",
                         flush=True,
                     )
                     return False

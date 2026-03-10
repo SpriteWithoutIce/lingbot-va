@@ -49,9 +49,10 @@ class Sapien_TEST(gym.Env):
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")
-        except:
-            print("\033[31m" + "Render Error" + "\033[0m")
-            exit()
+        except Exception as e:
+            print("\033[31mRender Error: %s\033[0m" % (e,))
+            print("  (无显示器/无 GPU 时常见。可尝试: xvfb-run -a bash .../launch_client.sh 或设置 ROBOTWIN_SKIP_RENDER_TEST=1 跳过此检查)")
+            exit(1)
 
     def setup_scene(self, **kwargs):
         """

@@ -68,7 +68,7 @@ class Trainer:
             self.wandb.init(
                 project=os.getenv("SWANLAB_PROJECT", "va_robotwin"),
                 config=dict(config),
-                name="test_lln",
+                name=getattr(config, "run_name", None) or "test_lln",
             )
             logger.info("WandB logging enabled")
         self.step = 0
@@ -675,6 +675,9 @@ def run(args):
     if args.resume_from is not None:
         config.resume_from = args.resume_from
 
+    if getattr(args, "run_name", None) is not None:
+        config.run_name = args.run_name
+
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
@@ -703,6 +706,12 @@ def main():
         type=str,
         default=None,
         help="Path to checkpoint directory to resume from (e.g. .../checkpoint_step_1000)",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="WandB/SwanLab run name (default: test_lln)",
     )
 
     args = parser.parse_args()
