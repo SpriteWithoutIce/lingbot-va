@@ -75,7 +75,7 @@ def process_one_dataset(root, args, vae, tokenizer, text_encoder, device, dtype)
             effective_end = st + n_latent * 4
             latent_frame_ids = [st + 4 * i for i in range(n_latent)]
 
-            text = prompt_clean(ac.get('action_text', ''))
+            text = "You are a dual-arm ALOHA robot. The cameras include one fixed high camera and two movable left and right arm cameras. Your task is: " + prompt_clean(ac.get('action_text', ''))
             text_emb = get_text_emb(text, tokenizer, text_encoder, device, dtype)
 
             vae_device = next(vae.parameters()).device
