@@ -21,7 +21,7 @@ va_robotwin_cfg.obs_cam_keys = [
     'observation.images.cam_right_wrist'
 ]
 va_robotwin_cfg.guidance_scale = 5
-va_robotwin_cfg.action_guidance_scale = 1
+va_robotwin_cfg.action_guidance_scale = 0.05
 
 va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1

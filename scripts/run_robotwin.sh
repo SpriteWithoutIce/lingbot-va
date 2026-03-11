@@ -5,7 +5,7 @@
 set -x
 umask 007
 
-NGPU=${NGPU:-"4"}
+NGPU=${NGPU:-"2"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"}
 SAVE_ROOT=${SAVE_ROOT:-"./train_out/robotwin"}
@@ -29,6 +29,6 @@ python -m torch.distributed.run \
     --master_port ${MASTER_PORT} \
     -m wan_va.train --config-name ${CONFIG_NAME} --save-root "${SAVE_ROOT}" \
     --run-name robotwin_train_$(date +"%Y%m%d_%H%M%S") \
-    --resume-from /home/jwhe/linyihan/lingbot-va/train_out/robotwin/checkpoints_20260309_170301/checkpoint_step_2000 \
+    --resume-from /home/jwhe/linyihan/lingbot-va/train_out/robotwin/checkpoints_20260310_174112/checkpoint_step_2000 \
     "$@" \
     > ${LOGFILE} 2>&1
