@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -141,6 +142,88 @@ def _merge_group_heatmaps(hm_chw: torch.Tensor, z_dim: int) -> torch.Tensor:
     return torch.cat(parts, dim=1)
 
 
+def _load_video_frames_range(video_path: Path, start_frame: int, end_frame: int) -> list[torch.Tensor]:
+    """Load RGB frames [start_frame, end_frame) from one mp4 via pyav.
+
+    Returns a list of uint8 tensors [3,H,W].
+    """
+    import av
+
+    out = []
+    with av.open(str(video_path)) as container:
+        for i, frame in enumerate(container.decode(video=0)):
+            if i >= end_frame:
+                break
+            if i < start_frame:
+                continue
+            arr = frame.to_ndarray(format="rgb24")
+            t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(torch.uint8)
+            out.append(t)
+    return out
+
+
+def _resize_chw_uint8(img: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    x = img.float()[None]
+    x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+    return x[0].round().clamp(0, 255).to(torch.uint8)
+
+
+def _compose_frame_robotwin_tshape(high: torch.Tensor, left: torch.Tensor, right: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    # high -> (h,w), wrist -> (h//2,w//2), then [wrist_row; high]
+    high_r = _resize_chw_uint8(high, h, w)
+    left_r = _resize_chw_uint8(left, h // 2, w // 2)
+    right_r = _resize_chw_uint8(right, h // 2, w // 2)
+    wrist_row = torch.cat([left_r, right_r], dim=2)
+    comp = torch.cat([wrist_row, high_r], dim=1)
+    return comp.permute(1, 2, 0).contiguous()  # [H,W,3]
+
+
+def _build_original_frame_sequence(cur_dset, cur_meta: dict, num_latent_frames: int, cfg) -> list[torch.Tensor]:
+    """Build composed original frames aligned with latent layout.
+
+    Returns list length == num_latent_frames * 4 of uint8 [H,W,3].
+    """
+    root = Path(cur_dset.repo_id)
+    info = json.loads((root / "meta" / "info.json").read_text())
+    ep = int(cur_meta["episode_index"])
+    start = int(cur_meta["start_frame"])
+    end = int(cur_meta["end_frame"])
+    chunk_size = int(info.get("chunks_size", 100000))
+    chunk = ep // chunk_size
+    tpl = info.get("video_path", "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4")
+
+    max_needed = num_latent_frames * 4
+    end_eff = min(end, start + max_needed)
+
+    cams = cfg.obs_cam_keys
+    cam_frames = {}
+    for cam in cams:
+        rel = tpl.format(episode_chunk=chunk, video_key=cam, episode_index=ep)
+        video_file = root / rel
+        cam_frames[cam] = _load_video_frames_range(video_file, start, end_eff)
+
+    T = min(len(v) for v in cam_frames.values())
+    if T == 0:
+        return []
+
+    out = []
+    for i in range(T):
+        if cfg.env_type == "robotwin_tshape" and len(cams) >= 3:
+            frame = _compose_frame_robotwin_tshape(
+                cam_frames[cams[0]][i],
+                cam_frames[cams[1]][i],
+                cam_frames[cams[2]][i],
+                h=cfg.height,
+                w=cfg.width,
+            )
+        else:
+            # generic: resize all to (h,w), concat in width
+            parts = [_resize_chw_uint8(cam_frames[c][i], cfg.height, cfg.width) for c in cams]
+            frame = torch.cat(parts, dim=2).permute(1, 2, 0).contiguous()
+        out.append(frame)
+    return out
+
+
 def _to_color_heatmap(hm: torch.Tensor) -> torch.Tensor:
     """hm [H,W] in [0,1] -> uint8 [H,W,3]"""
     r = torch.clamp(1.5 * hm, 0.0, 1.0)
@@ -198,6 +281,7 @@ def parse_args():
 
     p.add_argument("--alpha", type=float, default=0.45)
     p.add_argument("--max_frame_pairs", type=int, default=8)
+    p.add_argument("--delta_source", type=str, default="pred", choices=["pred", "target"], help="Use pred_v or target_v for Δv")
     p.add_argument("--out_dir", type=str, default="outputs/velocity_delta_viz_train")
     return p.parse_args()
 
@@ -217,6 +301,10 @@ def main():
 
     dataset = MultiLatentLeRobotDataset(cfg)
     sample = dataset[args.sample_index]
+    dset_id = dataset.item_id_to_dataset_id[args.sample_index]
+    local_idx = args.sample_index - dataset.acc_dset_num[dset_id]
+    cur_dset = dataset._datasets[dset_id]
+    cur_meta = cur_dset.new_metas[local_idx]
 
     latents = sample["latents"].unsqueeze(0).to(device)  # [1,C,F,H,W]
     text_emb = sample["text_emb"].unsqueeze(0).to(device)
@@ -269,9 +357,13 @@ def main():
         pred_seq = model(input_dict, train_mode=False)
     pred_v = data_seq_to_patch(model.patch_size, pred_seq, Ff, Hh, Ww, batch_size=1)
 
-    # frame 维度上的 delta
-    delta_target = target_v[:, :, 1:] - target_v[:, :, :-1]  # [1,C,F-1,H,W]
-    delta_pred = pred_v[:, :, 1:] - pred_v[:, :, :-1]
+    # frame 维度上的 delta（按用户定义：delta[0]=v0-0，delta[t]=v_t-v_{t-1}）
+    delta_target = torch.zeros_like(target_v)
+    delta_pred = torch.zeros_like(pred_v)
+    delta_target[:, :, 0] = target_v[:, :, 0]
+    delta_pred[:, :, 0] = pred_v[:, :, 0]
+    delta_target[:, :, 1:] = target_v[:, :, 1:] - target_v[:, :, :-1]
+    delta_pred[:, :, 1:] = pred_v[:, :, 1:] - pred_v[:, :, :-1]
 
     vae = _load_vae_from_base(Path(args.base_ckpt_dir), device=device, dtype=torch.bfloat16)
     vae.eval()
@@ -283,35 +375,44 @@ def main():
             "Please check dataset latent format or base VAE path."
         )
 
-    decoded = _decode_latents_to_frames(vae, latents)[0].cpu()  # [F,Himg,Wimg,3]
+    # original composed frames (o1...): used as final visualization background
+    original_frames = _build_original_frame_sequence(cur_dset, cur_meta, num_latent_frames=Ff, cfg=cfg)
+    if len(original_frames) < Ff * 4:
+        print(f"[warn] original frames only {len(original_frames)} < required {Ff*4}, will visualize available frames only")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    max_pairs = min(args.max_frame_pairs, delta_target.shape[2])
+    delta_used = delta_pred if args.delta_source == "pred" else delta_target
+    max_pairs = min(args.max_frame_pairs, delta_used.shape[2])
     for i in range(max_pairs):
         # [C,H,W] -> [H,W]
-        hm_t = _merge_group_heatmaps(delta_target[0, :, i], z_dim=z_dim)
-        hm_p = _merge_group_heatmaps(delta_pred[0, :, i], z_dim=z_dim)
+        hm = _merge_group_heatmaps(delta_used[0, :, i], z_dim=z_dim)
 
         def _norm(x):
             x = x - x.min()
             return x / (x.max() + 1e-6)
 
-        hm_t = _norm(hm_t)
-        hm_p = _norm(hm_p)
+        hm = _norm(hm)
 
-        h_img, w_img = decoded.shape[1], decoded.shape[2]
-        hm_t = F.interpolate(hm_t[None, None], size=(h_img, w_img), mode="bilinear", align_corners=False)[0, 0].cpu()
-        hm_p = F.interpolate(hm_p[None, None], size=(h_img, w_img), mode="bilinear", align_corners=False)[0, 0].cpu()
+        # map delta_i to original frames [4i, 4i+1, 4i+2, 4i+3]
+        st = i * 4
+        ed = st + 4
+        if st >= len(original_frames):
+            break
+        group_frames = original_frames[st:min(ed, len(original_frames))]
+        for j, bg in enumerate(group_frames):
+            h_img, w_img = bg.shape[0], bg.shape[1]
+            hm_up = F.interpolate(hm[None, None], size=(h_img, w_img), mode="bilinear", align_corners=False)[0, 0].cpu()
+            hm_rgb = _to_color_heatmap(hm_up)
+            ov = _overlay(bg, hm_rgb, args.alpha)
 
-        z_prev = decoded[i]
-        z_cur = decoded[i + 1]
+            frame_global = st + j
+            from PIL import Image
+            Image.fromarray(ov.numpy()).save(out_dir / f"delta_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
+            Image.fromarray(hm_rgb.numpy()).save(out_dir / f"weight_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
 
-        _save_panel(z_prev, z_cur, hm_t, args.alpha, out_dir / f"target_delta_v_frame_{i+1:03d}.png")
-        _save_panel(z_prev, z_cur, hm_p, args.alpha, out_dir / f"pred_delta_v_frame_{i+1:03d}.png")
-
-    print(f"Done. Saved {max_pairs * 2} images to {out_dir}")
+    print(f"Done. Saved overlays/weights to {out_dir}")
 
 
 if __name__ == "__main__":
