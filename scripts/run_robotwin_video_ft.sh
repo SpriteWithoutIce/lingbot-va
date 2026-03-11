@@ -6,7 +6,7 @@ export PYTHONPATH=${PYTHONPATH:-}:/home/jwhe/linyihan/lingbot-va
 #   a) a single dataset root (.../meta/info.json)
 #   b) a parent directory containing multiple dataset roots
 python scripts/robotwin_data_processing/extract_robotwin_video_latents.py \
-  --dataset_path /home/jwhe/linyihan/datasets/lerobot_robotwin_eef_clean_50 \
+  --dataset_path /home/jwhe/linyihan/datasets/lerobot_robotwin_eef_clean_50/adjust_bottle-demo_clean_collect_200-50 \
   --vae_dir /home/jwhe/linyihan/lingbot-va-base/vae \
   --text_encoder_dir /home/jwhe/linyihan/lingbot-va-base/text_encoder \
   --tokenizer_dir /home/jwhe/linyihan/lingbot-va-base/tokenizer \

@@ -21,14 +21,14 @@ export TORCH_CPP_LOG_LEVEL=ERROR
 
 export TOKENIZERS_PARALLELISM=false
 mkdir -p logs
-LOGFILE=logs/train_robotwin_$(date +"%Y%m%d_%H%M%S").log
+LOGFILE=logs/train_wan_$(date +"%Y%m%d_%H%M%S").log
 
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
 python -m torch.distributed.run \
     --nproc_per_node=${NGPU} \
     --master_port ${MASTER_PORT} \
     -m wan_va.train --config-name ${CONFIG_NAME} --save-root "${SAVE_ROOT}" \
-    --run-name robotwin_train_$(date +"%Y%m%d_%H%M%S") \
+    --run-name wan_train_$(date +"%Y%m%d_%H%M%S") \
     --config-name robotwin_video_train \
     "$@" \
-    # > ${LOGFILE} 2>&1
+    > ${LOGFILE} 2>&1

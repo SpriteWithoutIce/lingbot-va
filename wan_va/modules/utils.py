@@ -14,6 +14,60 @@ from .model import WanTransformer3DModel
 from .video_finetune_model import WanVideoFinetuneTransformer3DModel
 
 
+def remap_video_model_state_dict_to_wan_official(state_dict, in_channels=48, patch_size=(1, 2, 2)):
+    """将 WanVideoFinetuneTransformer3DModel 的 state_dict 转成 Wan 官方 ckpt 的 key，便于用 Wan 方式加载。
+
+    仅包含我们模型里存在的 key；norm3.weight/bias 等 Wan 有、我们无的不会出现在输出中。
+    """
+    out = {}
+    # 用于 patch_embedding 的 Conv3d 形状
+    kt, kh, kw = patch_size[0], patch_size[1], patch_size[2]
+    for k, v in state_dict.items():
+        v = v.detach().cpu()
+        new_k = None
+        if k == "patch_embedding_mlp.weight":
+            # Linear (dim, in*kt*kh*kw) -> Conv3d (dim, in, kt, kh, kw)
+            dim, flat = v.shape
+            out["patch_embedding.weight"] = v.reshape(dim, in_channels, kt, kh, kw).clone()
+            continue
+        if k == "patch_embedding_mlp.bias":
+            out["patch_embedding.bias"] = v.clone()
+            continue
+        if k.startswith("condition_embedder.time_embedder.linear_1."):
+            new_k = k.replace("condition_embedder.time_embedder.linear_1.", "time_embedding.0.")
+        elif k.startswith("condition_embedder.time_embedder.linear_2."):
+            new_k = k.replace("condition_embedder.time_embedder.linear_2.", "time_embedding.2.")
+        elif k.startswith("condition_embedder.time_proj."):
+            new_k = k.replace("condition_embedder.time_proj.", "time_projection.1.")
+        elif k.startswith("condition_embedder.text_embedder.linear_1."):
+            new_k = k.replace("condition_embedder.text_embedder.linear_1.", "text_embedding.0.")
+        elif k.startswith("condition_embedder.text_embedder.linear_2."):
+            new_k = k.replace("condition_embedder.text_embedder.linear_2.", "text_embedding.2.")
+        elif k == "scale_shift_table":
+            new_k = "head.modulation"
+        elif k.startswith("proj_out."):
+            new_k = k.replace("proj_out.", "head.head.")
+        elif ".attn1." in k:
+            new_k = k.replace(".attn1.", ".self_attn.")
+            new_k = new_k.replace(".to_q.", ".q.").replace(".to_k.", ".k.").replace(".to_v.", ".v.")
+            new_k = new_k.replace(".to_out.0.", ".o.")
+        elif ".attn2." in k:
+            new_k = k.replace(".attn2.", ".cross_attn.")
+            new_k = new_k.replace(".to_q.", ".q.").replace(".to_k.", ".k.").replace(".to_v.", ".v.")
+            new_k = new_k.replace(".to_out.0.", ".o.")
+        elif ".scale_shift_table" in k and "blocks." in k:
+            new_k = k.replace(".scale_shift_table", ".modulation")
+        elif ".ffn.net.0.proj." in k:
+            new_k = k.replace(".ffn.net.0.proj.", ".ffn.0.")
+        elif ".ffn.net.2." in k:
+            new_k = k.replace(".ffn.net.2.", ".ffn.2.")
+        elif "blocks." in k and ".norm2." in k:
+            new_k = k  # 与 Wan 一致，无需改名
+        if new_k is not None:
+            out[new_k] = v.clone()
+    return out
+
+
 def load_vae(
     vae_path,
     torch_dtype,
@@ -97,21 +151,57 @@ def _build_video_model_from_wan_config(ckpt_root: Path, attn_mode: str):
 
 
 def _remap_wan_key_to_video_model(k: str):
+    """Map official Wan checkpoint keys to WanVideoFinetuneTransformer3DModel state_dict keys."""
     candidates = [k]
+
+    # 1) 去掉可选的 "model." 前缀（部分 checkpoint 带此前缀）
+    if k.startswith("model."):
+        candidates.append(k[len("model."):])
+
+    # 2) 顶层/embedding 的替换（与官方 Wan 命名一致）
     replacements = [
         ("patch_embedding.", "patch_embedding_mlp."),
+        ("time_embedding.0.", "condition_embedder.time_embedder.linear_1."),
+        ("time_embedding.2.", "condition_embedder.time_embedder.linear_2."),
+        ("time_projection.1.", "condition_embedder.time_proj."),
+        ("text_embedding.0.", "condition_embedder.text_embedder.linear_1."),
+        ("text_embedding.2.", "condition_embedder.text_embedder.linear_2."),
+        ("head.head.", "proj_out."),
+        ("head.modulation", "scale_shift_table"),
+    ]
+    for src, dst in replacements:
+        if k.startswith(src) or (src in k and k.replace(src, dst) != k):
+            candidates.append(k.replace(src, dst))
+
+    # 3) 兼容旧逻辑里的通用替换（用于非官方格式）
+    for src, dst in [
         ("time_embedding.", "condition_embedder.time_embedder."),
         ("time_projection.", "condition_embedder.time_proj."),
         ("text_embedding.", "condition_embedder.text_embedder."),
         ("norm.", "norm_out."),
         ("head.", "proj_out."),
         ("modulation.", "scale_shift_table."),
-    ]
-    for src, dst in replacements:
+    ]:
         if src in k:
             candidates.append(k.replace(src, dst))
-    if k.startswith("model."):
-        candidates.append(k[len("model."):])
+
+    # 4) blocks 内：官方 Wan 使用 self_attn / cross_attn / modulation / ffn.0|2，我们使用 attn1 / attn2 / scale_shift_table / ffn.net.0|2
+    if ".self_attn." in k:
+        c = k.replace(".self_attn.", ".attn1.")
+        c = c.replace(".q.", ".to_q.").replace(".k.", ".to_k.").replace(".v.", ".to_v.").replace(".o.", ".to_out.0.")
+        candidates.append(c)
+    if ".cross_attn." in k:
+        c = k.replace(".cross_attn.", ".attn2.")
+        c = c.replace(".q.", ".to_q.").replace(".k.", ".to_k.").replace(".v.", ".to_v.").replace(".o.", ".to_out.0.")
+        candidates.append(c)
+    if ".modulation" in k and "blocks." in k:
+        candidates.append(k.replace(".modulation", ".scale_shift_table"))
+    # diffusers FeedForward: net.0 是 GELU(proj=Linear), net.2 是 Linear；故 ffn.0 -> net.0.proj, ffn.2 -> net.2
+    if ".ffn.0." in k:
+        candidates.append(k.replace(".ffn.0.", ".ffn.net.0.proj."))
+    if ".ffn.2." in k:
+        candidates.append(k.replace(".ffn.2.", ".ffn.net.2."))
+
     return candidates
 
 
@@ -135,11 +225,38 @@ def _load_video_model_from_wan_official(
                 used_src.add(sk)
                 break
 
+    # patch_embedding: 官方为 Conv3d (out, in, 1, 2, 2)，我们为 Linear (out, in*1*2*2)，需 reshape 后加载
+    if "patch_embedding.weight" in src_sd and "patch_embedding.weight" not in used_src:
+        w = src_sd["patch_embedding.weight"]
+        if w.ndim == 5 and "patch_embedding_mlp.weight" in tgt_sd:
+            # Conv3d weight (dim, in_dim, kT, kH, kW) -> Linear (dim, in_dim * kT * kH * kW)
+            out_dim, in_dim = w.shape[0], w.shape[1]
+            merged["patch_embedding_mlp.weight"] = w.reshape(out_dim, -1).clone()
+            used_src.add("patch_embedding.weight")
+    if "patch_embedding.bias" in src_sd and "patch_embedding.bias" not in used_src:
+        b = src_sd["patch_embedding.bias"]
+        if "patch_embedding_mlp.bias" in tgt_sd and b.shape == tgt_sd["patch_embedding_mlp.bias"].shape:
+            merged["patch_embedding_mlp.bias"] = b.clone()
+            used_src.add("patch_embedding.bias")
+
     missing, unexpected = model.load_state_dict(merged, strict=False)
+    unused_src = [k for k in src_sd if k not in used_src]
+    n_norm3 = sum(1 for k in unused_src if ".norm3." in k)
+    other_unused = [k for k in unused_src if ".norm3." not in k]
     print(
         f"[wan init] matched={len(merged)} used_src={len(used_src)}/{len(src_sd)} "
         f"missing={len(missing)} unexpected={len(unexpected)}"
     )
+    if unused_src:
+        print(
+            f"[wan init] unused: {len(unused_src)} ({n_norm3}× norm3.weight/bias [no affine in model]"
+            + (f", {len(other_unused)} other)" if other_unused else ")")
+        )
+        if other_unused:
+            for k in other_unused[:15]:
+                print("  ", k)
+            if len(other_unused) > 15:
+                print("  ...")
 
     model = model.to(torch_device)
     if torch_dtype is not None:

@@ -19,6 +19,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from safetensors.torch import save_file, load_file
 import json
+import shutil
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -33,6 +34,7 @@ from distributed.util import (
 from einops import rearrange
 from modules.utils import (
     load_transformer,
+    remap_video_model_state_dict_to_wan_official,
 )
 from utils import (
     init_logger, 
@@ -388,17 +390,41 @@ class Trainer:
 
                 logger.info(f"Saving transformer to {transformer_dir}")
 
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
-                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
-                save_file(state_dict_bf16, model_file)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
-                config_dict = dict(self.transformer.config)
-                config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
+                save_wan_official = (
+                    getattr(self.config, "transformer_source", None) == "wan_official"
+                    and getattr(self.config, "transformer_model_name", None) == "wan_video_finetune"
+                )
+                if save_wan_official:
+                    # 保存为 Wan 官方 key，便于用 Wan 方式加载（WanModel.from_pretrained）
+                    in_channels = getattr(self.transformer.config, "in_channels", 48)
+                    patch_size = getattr(self.transformer.config, "patch_size", [1, 2, 2])
+                    if isinstance(patch_size, (list, tuple)):
+                        patch_size = tuple(patch_size)
+                    else:
+                        patch_size = (1, 2, 2)
+                    state_dict_to_save = remap_video_model_state_dict_to_wan_official(
+                        state_dict_bf16, in_channels=in_channels, patch_size=patch_size
+                    )
+                    model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+                    save_file(state_dict_to_save, model_file)
+                    # 复制 Wan 官方 config.json，便于 Wan 加载
+                    wan_ckpt = Path(getattr(self.config, "wan_official_ckpt_path", ""))
+                    if wan_ckpt and (wan_ckpt / "config.json").exists():
+                        shutil.copy2(wan_ckpt / "config.json", transformer_dir / "config.json")
+                    else:
+                        config_dict = dict(self.transformer.config)
+                        config_dict.pop("_name_or_path", None)
+                        with open(transformer_dir / "config.json", "w") as f:
+                            json.dump(config_dict, f, indent=2)
+                else:
+                    # 原有 diffusers 格式（lingbot_va 自用 key）
+                    model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+                    save_file(state_dict_bf16, model_file)
+                    config_file = transformer_dir / "config.json"
+                    config_dict = dict(self.transformer.config)
+                    config_dict.pop("_name_or_path", None)
+                    with open(config_file, "w") as f:
+                        json.dump(config_dict, f, indent=2)
 
                 # # Save optimizer state and training metadata in PyTorch format
                 # training_state_path = checkpoint_dir / "training_state.pt"
