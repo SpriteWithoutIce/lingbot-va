@@ -5,7 +5,7 @@
 - 脚本：`scripts/visualization/visualize_velocity_delta.py`
 - 直接复用训练侧组件：`VA_CONFIGS`、`MultiLatentLeRobotDataset`、`FlowMatchScheduler`、`load_transformer`
 - **模型加载**：从你训练保存的 `checkpoint_step_xxx/transformer` 加载 DiT
-- **decoder 加载**：从 base Wan ckpt 加载 VAE（`--base_ckpt_dir/vae`）
+- **decoder 加载**：优先按 `root + subfolder=vae` 方式从 base Wan ckpt 加载；也兼容直接传 `vae` 目录
 
 ---
 
@@ -40,7 +40,11 @@ python scripts/visualization/visualize_velocity_delta.py \
 ### 常用参数
 
 - `--train_ckpt`: 既可传 `checkpoint_step_xxx`，也可直接传其下 `transformer/`
-- `--base_ckpt_dir`: Wan base ckpt 根目录（含 `vae/`），或直接是 `vae/` 目录
+- `--base_ckpt_dir`: **推荐**传 Wan base ckpt 根目录（含 `vae/`）。也可直接传 `vae/` 目录。
+
+> 如果你把 `--base_ckpt_dir` 指到 TI2V 根目录但未正确走 `vae` 子目录，会出现
+> “The config attributes {'dim', ...} were passed to AutoencoderKLWan” 这类告警。
+> 当前脚本已优先使用 `subfolder="vae"` 避免此问题。
 - `--dataset_path`: 可覆盖 config 里的数据集路径
 - `--latent_subdir`: 可覆盖 config 里的 latent 子目录（如 `latents_video_ft`）
 - `--timestep_id`: 构造 noisy latent 时用的 diffusion timestep index（0~999）
