@@ -12,7 +12,7 @@ va_robotwin_train_cfg.dataset_path = '/home/jwhe/linyihan/datasets/lerobot_robot
 va_robotwin_train_cfg.empty_emb_path = os.path.join(va_robotwin_train_cfg.dataset_path, 'empty_emb.pt')
 va_robotwin_train_cfg.enable_wandb = True
 va_robotwin_train_cfg.load_worker = 16
-va_robotwin_train_cfg.save_interval = 500
+va_robotwin_train_cfg.save_interval = 1000
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
 
