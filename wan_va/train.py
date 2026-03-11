@@ -83,12 +83,17 @@ class Trainer:
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
 
+        transformer_source = getattr(config, "transformer_source", "lingbot_va")
         if hasattr(config, 'resume_from') and config.resume_from:
             transformer_path = os.path.join(config.resume_from, 'transformer')
+            transformer_source = "lingbot_va"
             if config.rank == 0:
                 logger.info(f"Resuming from checkpoint: {transformer_path}")
         else:
-            transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
+            if transformer_source == "wan_official":
+                transformer_path = getattr(config, "wan_official_ckpt_path", config.wan22_pretrained_model_name_or_path)
+            else:
+                transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
 
         self.transformer = load_transformer(
             transformer_path,
@@ -96,6 +101,7 @@ class Trainer:
             torch_device='cpu',
             attn_mode="flex",
             model_name=getattr(config, "transformer_model_name", "wan_va"),
+            transformer_source=transformer_source,
         )
 
         logger.info("Setting up activation checkpointing ...")

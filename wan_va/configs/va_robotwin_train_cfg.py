@@ -33,3 +33,8 @@ va_robotwin_train_cfg.train_video_only = False
 va_robotwin_train_cfg.latent_subdir = 'latents'
 # Model selector: 'wan_va' (joint video+action) or 'wan_video_finetune' (video only)
 va_robotwin_train_cfg.transformer_model_name = 'wan_va'
+
+# transformer init source: 'lingbot_va' or 'wan_official'
+va_robotwin_train_cfg.transformer_source = 'lingbot_va'
+# used when transformer_source='wan_official'
+va_robotwin_train_cfg.wan_official_ckpt_path = '/home/jwhe/linyihan/Wan2.2-TI2V-5B'

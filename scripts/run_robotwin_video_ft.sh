@@ -14,3 +14,6 @@ set -euo pipefail
 
 # 2) Train video-only WAN finetune model (flow-matching velocity field)
 torchrun --nproc_per_node=8 wan_va/train.py --config robotwin_video_train
+
+# Note: robotwin_video_train now initializes transformer from wan_official_ckpt_path
+# default: /home/jwhe/linyihan/Wan2.2-TI2V-5B
