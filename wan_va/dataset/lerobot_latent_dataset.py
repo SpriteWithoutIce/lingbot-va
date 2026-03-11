@@ -193,7 +193,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
-        self.latent_path = Path(repo_id) / 'latents'
+        self.latent_path = Path(repo_id) / getattr(config, 'latent_subdir', 'latents')
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob

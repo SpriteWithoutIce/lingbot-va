@@ -25,3 +25,11 @@ va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 1 
 va_robotwin_train_cfg.gradient_accumulation_steps = 16
 va_robotwin_train_cfg.num_steps = 2000
+
+
+# Video-only WAN finetuning (no action branch)
+va_robotwin_train_cfg.train_video_only = False
+# Pre-extracted latent root under dataset_path (default keeps existing latents/)
+va_robotwin_train_cfg.latent_subdir = 'latents'
+# Model selector: 'wan_va' (joint video+action) or 'wan_video_finetune' (video only)
+va_robotwin_train_cfg.transformer_model_name = 'wan_va'

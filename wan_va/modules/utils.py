@@ -7,6 +7,7 @@ from transformers import (
 )
 
 from .model import WanTransformer3DModel
+from .video_finetune_model import WanVideoFinetuneTransformer3DModel
 
 
 def load_vae(
@@ -45,9 +46,11 @@ def load_transformer(
     torch_dtype,
     torch_device,
     attn_mode="torch",
+    model_name="wan_va",
 ):
     print("loading transformer from", transformer_path)
-    model = WanTransformer3DModel.from_pretrained(
+    model_cls = WanTransformer3DModel if model_name == "wan_va" else WanVideoFinetuneTransformer3DModel
+    model = model_cls.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
         attn_mode=attn_mode,
