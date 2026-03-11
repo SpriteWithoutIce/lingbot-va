@@ -24,7 +24,7 @@ from diffusers import AutoencoderKLWan
 
 from wan_va.configs import VA_CONFIGS
 from wan_va.dataset import MultiLatentLeRobotDataset
-from wan_va.modules.utils import load_transformer, load_vae
+from wan_va.modules.utils import load_transformer
 from wan_va.utils.scheduler import FlowMatchScheduler
 from wan_va.utils.utils import data_seq_to_patch, get_mesh_id
 
@@ -40,6 +40,7 @@ def _resolve_transformer_dir(train_ckpt: Path) -> Path:
         f"Cannot find transformer weights under {train_ckpt}. "
         "Expected diffusion_pytorch_model.safetensors or transformer/diffusion_pytorch_model.safetensors"
     )
+
 
 def _load_vae_from_base(base_ckpt_dir: Path, device: torch.device, dtype: torch.dtype) -> AutoencoderKLWan:
     """Load Wan VAE robustly from either:
@@ -79,10 +80,14 @@ def _load_vae_from_base(base_ckpt_dir: Path, device: torch.device, dtype: torch.
     )
     return vae.to(device)
 
-def _decode_latents_to_frames(vae, latents_bcfhw: torch.Tensor) -> torch.Tensor:
-    """latents_bcfhw: normalized latent [B,C,F,H,W] -> uint8 [B,F,H,W,3]"""
-    latents = latents_bcfhw.to(device=next(vae.parameters()).device, dtype=next(vae.parameters()).dtype)
 
+def _decode_one_group(vae, latents_bcfhw: torch.Tensor) -> torch.Tensor:
+    """Decode one latent group with channel count == VAE z_dim.
+
+    Input: normalized latent [B,C,F,H,W]
+    Output: uint8 [B,F,H,W,3]
+    """
+    latents = latents_bcfhw.to(device=next(vae.parameters()).device, dtype=next(vae.parameters()).dtype)
     mean = torch.tensor(vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
     latents = latents * std + mean
@@ -90,7 +95,50 @@ def _decode_latents_to_frames(vae, latents_bcfhw: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         video = vae.decode(latents, return_dict=False)[0]  # [B,3,F,H,W], [-1,1]
     video = ((video.clamp(-1, 1) + 1.0) * 0.5 * 255.0).round().to(torch.uint8)
-    return video.permute(0, 2, 3, 4, 1).contiguous()  # [B,F,H,W,3]
+    return video.permute(0, 2, 3, 4, 1).contiguous()
+
+
+def _decode_latents_to_frames(vae, latents_bcfhw: torch.Tensor) -> torch.Tensor:
+    """Decode normalized latents to RGB frames.
+
+    - If C == z_dim: decode directly.
+    - If C is multiple of z_dim (e.g. 48=3x16): split channels by group and decode each,
+      then concatenate decoded views along image width.
+    """
+    z_dim = int(getattr(vae.config, "z_dim", len(vae.config.latents_mean)))
+    c = int(latents_bcfhw.shape[1])
+
+    if c == z_dim:
+        return _decode_one_group(vae, latents_bcfhw)
+
+    if c % z_dim != 0:
+        raise ValueError(
+            f"Latent channels C={c} is not compatible with VAE z_dim={z_dim}. "
+            "Expected C==z_dim or C being a multiple of z_dim."
+        )
+
+    num_groups = c // z_dim
+    decoded_groups = []
+    for g in range(num_groups):
+        sub = latents_bcfhw[:, g * z_dim : (g + 1) * z_dim]
+        decoded_groups.append(_decode_one_group(vae, sub))
+    # [B,F,H,W,3] x G -> [B,F,H,W*G,3]
+    return torch.cat(decoded_groups, dim=3)
+
+
+def _merge_group_heatmaps(hm_chw: torch.Tensor, z_dim: int) -> torch.Tensor:
+    """hm_chw: [C,H,W] -> [H,W*G] if C=G*z_dim, else [H,W]."""
+    c = hm_chw.shape[0]
+    if c == z_dim:
+        return torch.sqrt(torch.clamp((hm_chw.float() ** 2).sum(dim=0), min=1e-12))
+    if c % z_dim != 0:
+        raise ValueError(f"Cannot split heatmap channels C={c} by z_dim={z_dim}")
+    g = c // z_dim
+    parts = []
+    for i in range(g):
+        part = hm_chw[i * z_dim : (i + 1) * z_dim]
+        parts.append(torch.sqrt(torch.clamp((part.float() ** 2).sum(dim=0), min=1e-12)))
+    return torch.cat(parts, dim=1)
 
 
 def _to_color_heatmap(hm: torch.Tensor) -> torch.Tensor:
@@ -134,7 +182,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="Visualize Δv on decoded z_t/z_{t-1} from training checkpoint")
     p.add_argument("--config_name", type=str, default="robotwin_video_train", choices=sorted(VA_CONFIGS.keys()))
     p.add_argument("--train_ckpt", type=str, required=True, help="checkpoint_step_xxx or .../transformer")
-    p.add_argument("--base_ckpt_dir", type=str, required=True, help="Wan base ckpt dir (contains vae/) or VAE dir")
+    p.add_argument(
+        "--base_ckpt_dir",
+        type=str,
+        required=True,
+        help="Wan base ckpt root (preferred, contains vae/) or direct VAE dir",
+    )
 
     p.add_argument("--sample_index", type=int, default=0, help="dataset sample index")
     p.add_argument("--noise_seed", type=int, default=0)
@@ -222,6 +275,14 @@ def main():
 
     vae = _load_vae_from_base(Path(args.base_ckpt_dir), device=device, dtype=torch.bfloat16)
     vae.eval()
+    z_dim = int(getattr(vae.config, "z_dim", len(vae.config.latents_mean)))
+
+    if latents.shape[1] != z_dim and latents.shape[1] % z_dim != 0:
+        raise ValueError(
+            f"Latent channels {latents.shape[1]} incompatible with VAE z_dim={z_dim}. "
+            "Please check dataset latent format or base VAE path."
+        )
+
     decoded = _decode_latents_to_frames(vae, latents)[0].cpu()  # [F,Himg,Wimg,3]
 
     out_dir = Path(args.out_dir)
@@ -230,8 +291,8 @@ def main():
     max_pairs = min(args.max_frame_pairs, delta_target.shape[2])
     for i in range(max_pairs):
         # [C,H,W] -> [H,W]
-        hm_t = torch.sqrt(torch.clamp((delta_target[0, :, i].float() ** 2).sum(dim=0), min=1e-12))
-        hm_p = torch.sqrt(torch.clamp((delta_pred[0, :, i].float() ** 2).sum(dim=0), min=1e-12))
+        hm_t = _merge_group_heatmaps(delta_target[0, :, i], z_dim=z_dim)
+        hm_p = _merge_group_heatmaps(delta_pred[0, :, i], z_dim=z_dim)
 
         def _norm(x):
             x = x - x.min()
