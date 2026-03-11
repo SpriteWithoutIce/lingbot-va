@@ -49,7 +49,13 @@ def load_transformer(
     model_name="wan_va",
 ):
     print("loading transformer from", transformer_path)
-    model_cls = WanTransformer3DModel if model_name == "wan_va" else WanVideoFinetuneTransformer3DModel
+    model_map = {
+        "wan_va": WanTransformer3DModel,
+        "wan_video_finetune": WanVideoFinetuneTransformer3DModel,
+    }
+    if model_name not in model_map:
+        raise ValueError(f"Unsupported transformer model_name: {model_name}. Supported: {list(model_map.keys())}")
+    model_cls = model_map[model_name]
     model = model_cls.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
