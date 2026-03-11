@@ -20,6 +20,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from diffusers import AutoencoderKLWan
 
 from wan_va.configs import VA_CONFIGS
 from wan_va.dataset import MultiLatentLeRobotDataset
@@ -40,16 +41,43 @@ def _resolve_transformer_dir(train_ckpt: Path) -> Path:
         "Expected diffusion_pytorch_model.safetensors or transformer/diffusion_pytorch_model.safetensors"
     )
 
+def _load_vae_from_base(base_ckpt_dir: Path, device: torch.device, dtype: torch.dtype) -> AutoencoderKLWan:
+    """Load Wan VAE robustly from either:
+    - a root ckpt dir containing subfolder `vae/`, or
+    - a direct VAE folder path.
 
-def _resolve_vae_dir(base_ckpt_dir: Path) -> Path:
-    cand = base_ckpt_dir / "vae"
-    if cand.exists():
-        return cand
-    # 兼容用户直接传 vae 目录
-    if (base_ckpt_dir / "config.json").exists():
-        return base_ckpt_dir
-    raise FileNotFoundError(f"Cannot find VAE dir under {base_ckpt_dir} (or itself is not a VAE dir).")
+    We force `low_cpu_mem_usage=False` to avoid meta tensors that can trigger
+    `Cannot copy out of meta tensor` when moving to device.
+    """
+    base_ckpt_dir = Path(base_ckpt_dir)
 
+    # 1) Most stable path: load from root + subfolder="vae"
+    try:
+        vae = AutoencoderKLWan.from_pretrained(
+            str(base_ckpt_dir),
+            subfolder="vae",
+            torch_dtype=dtype,
+            low_cpu_mem_usage=False,
+        )
+        return vae.to(device)
+    except Exception:
+        pass
+
+    # 2) Fallback: user passed direct VAE path
+    vae_dir = base_ckpt_dir / "vae" if (base_ckpt_dir / "vae").exists() else base_ckpt_dir
+    cfg_file = vae_dir / "config.json"
+    if not cfg_file.exists():
+        raise FileNotFoundError(
+            f"Cannot find VAE config at {cfg_file}. Please pass Wan base ckpt root (with vae/) "
+            "or pass direct --base_ckpt_dir=/path/to/vae."
+        )
+
+    vae = AutoencoderKLWan.from_pretrained(
+        str(vae_dir),
+        torch_dtype=dtype,
+        low_cpu_mem_usage=False,
+    )
+    return vae.to(device)
 
 def _decode_latents_to_frames(vae, latents_bcfhw: torch.Tensor) -> torch.Tensor:
     """latents_bcfhw: normalized latent [B,C,F,H,W] -> uint8 [B,F,H,W,3]"""
@@ -192,7 +220,7 @@ def main():
     delta_target = target_v[:, :, 1:] - target_v[:, :, :-1]  # [1,C,F-1,H,W]
     delta_pred = pred_v[:, :, 1:] - pred_v[:, :, :-1]
 
-    vae = load_vae(str(_resolve_vae_dir(Path(args.base_ckpt_dir))), torch_dtype=torch.bfloat16, torch_device=device)
+    vae = _load_vae_from_base(Path(args.base_ckpt_dir), device=device, dtype=torch.bfloat16)
     vae.eval()
     decoded = _decode_latents_to_frames(vae, latents)[0].cpu()  # [F,Himg,Wimg,3]
 
