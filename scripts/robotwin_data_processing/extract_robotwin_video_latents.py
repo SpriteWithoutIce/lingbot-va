@@ -24,7 +24,6 @@ from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from transformers import T5TokenizerFast, UMT5EncoderModel
 
 from scripts.libero_data_processing.extract_latents_wan22 import get_text_emb, load_video_frames
-from wan_va.modules.utils import WanVAEStreamingWrapper
 
 
 def normalize_latents(latents, vae):
@@ -59,37 +58,29 @@ def resize_view(clip, h, w):
     return clip
 
 
-def encode_robotwin_views(view_clips, streaming_vae, streaming_vae_half, dtype):
-    """Match wan_va_server._encode_obs robotwin_tshape branch.
-
-    Args:
-        view_clips: list of [cam_high, cam_left_wrist, cam_right_wrist], each (C,T,H,W) in [0,1]
-    Returns:
-        video_latent: (1, C, F, H_lat, W_lat)
-    """
+def encode_robotwin_views(view_clips, vae, dtype):
+    """Match wan_va_server._encode_obs robotwin_tshape branch, without streaming cache path."""
     videos = [v.unsqueeze(0) for v in view_clips]  # -> (1,C,T,H,W)
-    vae_device = next(streaming_vae.vae.parameters()).device
+    vae_device = next(vae.parameters()).device
 
     videos_high = videos[0] * 2.0 - 1.0
     videos_left_and_right = torch.cat(videos[1:], dim=0) * 2.0 - 1.0
 
     with torch.no_grad():
-        streaming_vae.clear_cache()
-        streaming_vae_half.clear_cache()
-        enc_out_high = streaming_vae.encode_chunk(videos_high.to(vae_device).to(dtype))
-        enc_out_left_and_right = streaming_vae_half.encode_chunk(videos_left_and_right.to(vae_device).to(dtype))
+        enc_out_high = vae.encode(videos_high.to(vae_device).to(dtype)).latent_dist.mode()
+        enc_out_left_and_right = vae.encode(videos_left_and_right.to(vae_device).to(dtype)).latent_dist.mode()
 
+    # enc_out_* are already mu latents in normalized VAE latent space pre global norm step
     enc_out = torch.cat(
         [torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1), enc_out_high],
         dim=-2,
     )
-    mu, _ = torch.chunk(enc_out, 2, dim=1)
-    mu_norm = normalize_latents(mu, streaming_vae.vae)
+    mu_norm = normalize_latents(enc_out, vae)
     video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-2)
     return video_latent
 
 
-def process_one_dataset(root, args, streaming_vae, streaming_vae_half, tokenizer, text_encoder, device, dtype):
+def process_one_dataset(root, args, vae, tokenizer, text_encoder, device, dtype):
     info = json.loads((root / 'meta' / 'info.json').read_text())
     episodes = [json.loads(x) for x in (root / 'meta' / 'episodes.jsonl').read_text().splitlines() if x.strip()]
     if args.max_episodes is not None:
@@ -141,8 +132,7 @@ def process_one_dataset(root, args, streaming_vae, streaming_vae_half, tokenizer
 
             video_latent = encode_robotwin_views(
                 view_clips,
-                streaming_vae=streaming_vae,
-                streaming_vae_half=streaming_vae_half,
+                vae=vae,
                 dtype=dtype,
             )
             lf, c, lft, lh, lw = 1, video_latent.shape[1], video_latent.shape[2], video_latent.shape[3], video_latent.shape[4]
@@ -200,9 +190,6 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     dtype = torch.bfloat16
     vae = AutoencoderKLWan.from_pretrained(args.vae_dir, torch_dtype=dtype).to(device)
-    vae_half = AutoencoderKLWan.from_pretrained(args.vae_dir, torch_dtype=dtype).to(device)
-    streaming_vae = WanVAEStreamingWrapper(vae)
-    streaming_vae_half = WanVAEStreamingWrapper(vae_half)
 
     tokenizer = T5TokenizerFast.from_pretrained(args.tokenizer_dir)
     text_encoder = UMT5EncoderModel.from_pretrained(args.text_encoder_dir, torch_dtype=dtype).to(device)
@@ -213,8 +200,7 @@ def main():
         process_one_dataset(
             root,
             args,
-            streaming_vae,
-            streaming_vae_half,
+            vae,
             tokenizer,
             text_encoder,
             device,
