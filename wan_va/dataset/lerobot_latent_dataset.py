@@ -193,7 +193,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
-        self.latent_path = Path(repo_id) / 'latents'
+        self.latent_path = Path(repo_id) / getattr(config, 'latent_subdir', 'latents')
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob
@@ -233,6 +233,7 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
+        loaded = {}
         for key in self.used_video_keys:
             cur_path = latent_path / key
             latent_file = (
@@ -243,6 +244,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             # 仅校验该视角下 latent 实际 token 数与文件内元数据一致（不同视角如 wrist 可分辨率更小、token 更少）
             try:
                 data = torch.load(latent_file, weights_only=False, map_location='cpu')
+                loaded[key] = data
                 actual_tokens = data["latent"].shape[0]
                 claimed_tokens = (
                     data["latent_num_frames"]
@@ -263,6 +265,66 @@ class LatentLeRobotDataset(LeRobotDataset):
                     flush=True,
                 )
                 return False
+
+        # 进一步校验：后续 torch.cat 的维度约束必须满足，否则训练时会在 DataLoader worker 里直接崩溃
+        # latent 在 _cat_video_latents 中会被 reshape 成 (F, H, W, C)
+        try:
+            # 通道维：tokens x C
+            def _ch(d):  # C
+                return int(d["latent"].shape[1])
+
+            def _F(d):
+                return int(d["latent_num_frames"])
+
+            def _H(d):
+                return int(d["latent_height"])
+
+            def _W(d):
+                return int(d["latent_width"])
+
+            if self.config.env_type == 'robotwin_tshape':
+                # wrist 视角们要在 dim=2(cat width) 拼接：要求 F/H/C 一致；W 可以不同
+                wrist_keys = list(self.used_video_keys[1:])
+                if len(wrist_keys) >= 2:
+                    f0, h0, c0 = _F(loaded[wrist_keys[0]]), _H(loaded[wrist_keys[0]]), _ch(loaded[wrist_keys[0]])
+                    for k in wrist_keys[1:]:
+                        if (_F(loaded[k]) != f0) or (_H(loaded[k]) != h0) or (_ch(loaded[k]) != c0):
+                            print(
+                                f"[_check_meta] skip ep={episode_index}: wrist latent mismatch "
+                                f"({wrist_keys[0]} F/H/C={f0}/{h0}/{c0} vs {k} F/H/C={_F(loaded[k])}/{_H(loaded[k])}/{_ch(loaded[k])})",
+                                flush=True,
+                            )
+                            return False
+
+                # 然后 wrist_latent 与 used_video_keys[0] 会在 dim=1(cat height) 拼接：
+                # 要求 F/W/C 一致。这里 W(主视角) 需要等于 sum(wrist Ws)，否则 cat 会失败。
+                main_key = self.used_video_keys[0]
+                if len(wrist_keys) >= 1:
+                    wrist_w_sum = sum(_W(loaded[k]) for k in wrist_keys)
+                    if (_F(loaded[main_key]) != _F(loaded[wrist_keys[0]])) or (_ch(loaded[main_key]) != _ch(loaded[wrist_keys[0]])):
+                        print(
+                            f"[_check_meta] skip ep={episode_index}: main vs wrist F/C mismatch "
+                            f"({main_key} F/C={_F(loaded[main_key])}/{_ch(loaded[main_key])} "
+                            f"vs {wrist_keys[0]} F/C={_F(loaded[wrist_keys[0]])}/{_ch(loaded[wrist_keys[0]])})",
+                            flush=True,
+                        )
+                        return False
+                    if _W(loaded[main_key]) != wrist_w_sum:
+                        print(
+                            f"[_check_meta] skip ep={episode_index}: main W != sum(wrist W) "
+                            f"({main_key} W={_W(loaded[main_key])} vs sum(wrist)={wrist_w_sum})",
+                            flush=True,
+                        )
+                        return False
+            else:
+                return True
+        except Exception as e:
+            print(
+                f"[_check_meta] skip ep={episode_index}: failed to validate latent shapes: {e}",
+                flush=True,
+            )
+            return False
+
         return True
 
     def _get_global_idx(self, episode_index: int, local_index: int):

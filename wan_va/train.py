@@ -19,6 +19,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from safetensors.torch import save_file, load_file
 import json
+import shutil
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -33,6 +34,7 @@ from distributed.util import (
 from einops import rearrange
 from modules.utils import (
     load_transformer,
+    remap_video_model_state_dict_to_wan_official,
 )
 from utils import (
     init_logger, 
@@ -83,18 +85,25 @@ class Trainer:
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
 
+        transformer_source = getattr(config, "transformer_source", "lingbot_va")
         if hasattr(config, 'resume_from') and config.resume_from:
             transformer_path = os.path.join(config.resume_from, 'transformer')
+            transformer_source = "lingbot_va"
             if config.rank == 0:
                 logger.info(f"Resuming from checkpoint: {transformer_path}")
         else:
-            transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
+            if transformer_source == "wan_official":
+                transformer_path = getattr(config, "wan_official_ckpt_path", config.wan22_pretrained_model_name_or_path)
+            else:
+                transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
 
         self.transformer = load_transformer(
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
             attn_mode="flex",
+            model_name=getattr(config, "transformer_model_name", "wan_va"),
+            transformer_source=transformer_source,
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -154,6 +163,7 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+        self.train_video_only = getattr(config, "train_video_only", False)
         self.train_loader_iter = None
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
@@ -238,6 +248,11 @@ class Trainer:
             action_mode=False,
             noisy_cond_prob=0.5)
         
+        latent_dict['text_emb'] = batch_dict['text_emb']
+
+        if self.train_video_only:
+            return {'latent_dict': latent_dict}
+
         action_dict = self._add_noise(
             latent=batch_dict['actions'], 
             train_scheduler=self.train_scheduler_action, 
@@ -245,7 +260,6 @@ class Trainer:
             action_mode=True,
             noisy_cond_prob=0.0)
 
-        latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
 
@@ -267,6 +281,23 @@ class Trainer:
         input_dict,
         pred
     ):
+        if self.train_video_only:
+            latent_pred = pred
+            latent_pred = data_seq_to_patch(
+                            self.patch_size, latent_pred,
+                            input_dict['latent_dict']['targets'].shape[-3], input_dict['latent_dict']['targets'].shape[-2],
+                            input_dict['latent_dict']['targets'].shape[-1], batch_size=latent_pred.shape[0])
+            Bn, Fn = input_dict['latent_dict']['timesteps'].shape
+            latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+            latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
+            latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
+            latent_loss = latent_loss.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
+            latent_loss_per_frame = latent_loss.sum(dim=1)
+            latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
+            latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+            zero = torch.zeros_like(latent_loss).detach()
+            return latent_loss / self.gradient_accumulation_steps, zero, zero
+
         latent_pred, action_pred = pred
         action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
         latent_pred = data_seq_to_patch(
@@ -280,29 +311,23 @@ class Trainer:
         # Frame-wise video loss calculation
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and compute mask per frame
-        latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
+        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)
+        latent_loss = latent_loss.flatten(0, 1).flatten(1)
+        latent_loss_per_frame = latent_loss.sum(dim=1)
+        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
         latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
 
-        # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
         mask = input_dict['action_dict']['actions_mask'].float()
         raw_mse_mean = (action_loss * mask).sum() / (mask.sum() + 1e-6)
-        
         action_loss = action_loss * action_loss_weight[:, None, :, None, None]
         action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and normalize by mask per frame
-        action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
-        action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
+        action_loss = action_loss.permute(0, 2, 3, 4, 1)
+        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)
+        action_loss = action_loss.flatten(0, 1).flatten(1)
+        action_mask = action_mask.flatten(0, 1).flatten(1)
+        action_loss_per_frame = action_loss.sum(dim=1)
+        action_mask_per_frame = action_mask.sum(dim=1)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, raw_mse_mean.detach()
@@ -365,17 +390,41 @@ class Trainer:
 
                 logger.info(f"Saving transformer to {transformer_dir}")
 
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
-                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
-                save_file(state_dict_bf16, model_file)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
-                config_dict = dict(self.transformer.config)
-                config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
+                save_wan_official = (
+                    getattr(self.config, "transformer_source", None) == "wan_official"
+                    and getattr(self.config, "transformer_model_name", None) == "wan_video_finetune"
+                )
+                if save_wan_official:
+                    # 保存为 Wan 官方 key，便于用 Wan 方式加载（WanModel.from_pretrained）
+                    in_channels = getattr(self.transformer.config, "in_channels", 48)
+                    patch_size = getattr(self.transformer.config, "patch_size", [1, 2, 2])
+                    if isinstance(patch_size, (list, tuple)):
+                        patch_size = tuple(patch_size)
+                    else:
+                        patch_size = (1, 2, 2)
+                    state_dict_to_save = remap_video_model_state_dict_to_wan_official(
+                        state_dict_bf16, in_channels=in_channels, patch_size=patch_size
+                    )
+                    model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+                    save_file(state_dict_to_save, model_file)
+                    # 复制 Wan 官方 config.json，便于 Wan 加载
+                    wan_ckpt = Path(getattr(self.config, "wan_official_ckpt_path", ""))
+                    if wan_ckpt and (wan_ckpt / "config.json").exists():
+                        shutil.copy2(wan_ckpt / "config.json", transformer_dir / "config.json")
+                    else:
+                        config_dict = dict(self.transformer.config)
+                        config_dict.pop("_name_or_path", None)
+                        with open(transformer_dir / "config.json", "w") as f:
+                            json.dump(config_dict, f, indent=2)
+                else:
+                    # 原有 diffusers 格式（lingbot_va 自用 key）
+                    model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+                    save_file(state_dict_bf16, model_file)
+                    config_file = transformer_dir / "config.json"
+                    config_dict = dict(self.transformer.config)
+                    config_dict.pop("_name_or_path", None)
+                    with open(config_file, "w") as f:
+                        json.dump(config_dict, f, indent=2)
 
                 # # Save optimizer state and training metadata in PyTorch format
                 # training_state_path = checkpoint_dir / "training_state.pt"
@@ -531,6 +580,9 @@ class Trainer:
     
     @torch.no_grad()
     def run_open_loop_eval(self, eval_batches):
+        if self.train_video_only:
+            logger.info("Skipping open-loop action eval in video-only training mode.")
+            return
         """从训练数据取若干 batch，每个 batch 随机采样多个 4-chunk 窗口做开环测试。
         每次推理只用 4 个 latent 帧（chunk_size=4）及其对应 action，与实际推理对齐：
           - action frame 0 置零作为条件帧（timestep=0）
