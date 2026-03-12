@@ -18,6 +18,7 @@ import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
+from datetime import datetime
 
 import torch
 import torch.nn.functional as F
@@ -272,15 +273,15 @@ def parse_args():
         help="Wan base ckpt root (preferred, contains vae/) or direct VAE dir",
     )
 
-    p.add_argument("--sample_index", type=int, default=0, help="dataset sample index")
+    p.add_argument("--sample_index", type=int, nargs="+", default=[0])
     p.add_argument("--noise_seed", type=int, default=0)
     p.add_argument("--timestep_id", type=int, default=500, help="diffusion timestep index [0,999]")
 
     p.add_argument("--dataset_path", type=str, default=None, help="optional override config.dataset_path")
     p.add_argument("--latent_subdir", type=str, default=None, help="optional override config.latent_subdir")
 
-    p.add_argument("--alpha", type=float, default=0.45)
-    p.add_argument("--max_frame_pairs", type=int, default=8)
+    p.add_argument("--alpha", type=float, default=0.6)
+    p.add_argument("--max_frame_pairs", type=int, default=10)
     p.add_argument("--delta_source", type=str, default="pred", choices=["pred", "target"], help="Use pred_v or target_v for Δv")
     p.add_argument("--out_dir", type=str, default="outputs/velocity_delta_viz_train")
     return p.parse_args()
@@ -300,15 +301,6 @@ def main():
         cfg.latent_subdir = args.latent_subdir
 
     dataset = MultiLatentLeRobotDataset(cfg)
-    sample = dataset[args.sample_index]
-    dset_id = dataset.item_id_to_dataset_id[args.sample_index]
-    local_idx = args.sample_index - dataset.acc_dset_num[dset_id]
-    cur_dset = dataset._datasets[dset_id]
-    cur_meta = cur_dset.new_metas[local_idx]
-
-    latents = sample["latents"].unsqueeze(0).to(device)  # [1,C,F,H,W]
-    text_emb = sample["text_emb"].unsqueeze(0).to(device)
-    _, _, Ff, Hh, Ww = latents.shape
 
     transformer_dir = _resolve_transformer_dir(Path(args.train_ckpt))
     model = load_transformer(
@@ -321,98 +313,134 @@ def main():
     )
     model.eval()
 
-    scheduler = FlowMatchScheduler(shift=getattr(cfg, "snr_shift", 3.0), sigma_min=0.0, extra_one_step=True)
-    scheduler.set_timesteps(1000, training=True)
-    t_id = int(max(0, min(999, args.timestep_id)))
-    timestep = scheduler.timesteps[t_id].to(device)
-    timesteps = timestep.repeat(Ff)
-
-    g = torch.Generator(device=device)
-    g.manual_seed(args.noise_seed)
-    noise = torch.randn(latents.shape, generator=g, device=device, dtype=latents.dtype)
-    noisy_latents = scheduler.add_noise(latents, noise, timesteps, t_dim=2)
-    target_v = scheduler.training_target(latents, noise, timesteps)  # [1,C,F,H,W]
-
-    patch_f, patch_h, patch_w = model.patch_size
-    grid_id = get_mesh_id(
-        Ff // patch_f,
-        Hh // patch_h,
-        Ww // patch_w,
-        t=0,
-        f_w=1,
-        f_shift=0,
-        action=False,
-    ).to(device)
-    grid_id = grid_id[None].repeat(1, 1, 1)
-
-    input_dict = {
-        "noisy_latents": noisy_latents.to(torch.bfloat16),
-        "latent": latents.to(torch.bfloat16),
-        "timesteps": timesteps[None],
-        "text_emb": text_emb.to(torch.bfloat16),
-        "grid_id": grid_id,
-    }
-
-    with torch.no_grad():
-        pred_seq = model(input_dict, train_mode=False)
-    pred_v = data_seq_to_patch(model.patch_size, pred_seq, Ff, Hh, Ww, batch_size=1)
-
-    # frame 维度上的 delta（按用户定义：delta[0]=v0-0，delta[t]=v_t-v_{t-1}）
-    delta_target = torch.zeros_like(target_v)
-    delta_pred = torch.zeros_like(pred_v)
-    delta_target[:, :, 0] = target_v[:, :, 0]
-    delta_pred[:, :, 0] = pred_v[:, :, 0]
-    delta_target[:, :, 1:] = target_v[:, :, 1:] - target_v[:, :, :-1]
-    delta_pred[:, :, 1:] = pred_v[:, :, 1:] - pred_v[:, :, :-1]
-
     vae = _load_vae_from_base(Path(args.base_ckpt_dir), device=device, dtype=torch.bfloat16)
     vae.eval()
-    z_dim = int(getattr(vae.config, "z_dim", len(vae.config.latents_mean)))
+    for si in args.sample_index:
+        # sample = dataset[si]
+        sample = dataset[si]
+        dset_id = dataset.item_id_to_dataset_id[si]
+        local_idx = si - dataset.acc_dset_num[dset_id]
+        cur_dset = dataset._datasets[dset_id]
+        cur_meta = cur_dset.new_metas[local_idx]
 
-    if latents.shape[1] != z_dim and latents.shape[1] % z_dim != 0:
-        raise ValueError(
-            f"Latent channels {latents.shape[1]} incompatible with VAE z_dim={z_dim}. "
-            "Please check dataset latent format or base VAE path."
-        )
+        latents = sample["latents"].unsqueeze(0).to(device)  # [1,C,F,H,W]
+        text_emb = sample["text_emb"].unsqueeze(0).to(device)
+        _, _, Ff, Hh, Ww = latents.shape
 
-    # original composed frames (o1...): used as final visualization background
-    original_frames = _build_original_frame_sequence(cur_dset, cur_meta, num_latent_frames=Ff, cfg=cfg)
-    if len(original_frames) < Ff * 4:
-        print(f"[warn] original frames only {len(original_frames)} < required {Ff*4}, will visualize available frames only")
+        scheduler = FlowMatchScheduler(shift=getattr(cfg, "snr_shift", 3.0), sigma_min=0.0, extra_one_step=True)
+        scheduler.set_timesteps(1000, training=True)
+        t_id = int(max(0, min(999, args.timestep_id)))
+        timestep = scheduler.timesteps[t_id].to(device)
+        timesteps = timestep.repeat(Ff)
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+        g = torch.Generator(device=device)
+        g.manual_seed(args.noise_seed)
+        noise = torch.randn(latents.shape, generator=g, device=device, dtype=latents.dtype)
+        noisy_latents = scheduler.add_noise(latents, noise, timesteps, t_dim=2)
+        target_v = scheduler.training_target(latents, noise, timesteps)  # [1,C,F,H,W]
 
-    delta_used = delta_pred if args.delta_source == "pred" else delta_target
-    max_pairs = min(args.max_frame_pairs, delta_used.shape[2])
-    for i in range(max_pairs):
-        # [C,H,W] -> [H,W]
-        hm = _merge_group_heatmaps(delta_used[0, :, i], z_dim=z_dim)
+        patch_f, patch_h, patch_w = model.patch_size
+        grid_id = get_mesh_id(
+            Ff // patch_f,
+            Hh // patch_h,
+            Ww // patch_w,
+            t=0,
+            f_w=1,
+            f_shift=0,
+            action=False,
+        ).to(device)
+        grid_id = grid_id[None].repeat(1, 1, 1)
 
-        def _norm(x):
-            x = x - x.min()
-            return x / (x.max() + 1e-6)
+        input_dict = {
+            "noisy_latents": noisy_latents.to(torch.bfloat16),
+            "latent": latents.to(torch.bfloat16),
+            "timesteps": timesteps[None],
+            "text_emb": text_emb.to(torch.bfloat16),
+            "grid_id": grid_id,
+        }
 
-        hm = _norm(hm)
+        with torch.no_grad():
+            pred_seq = model(input_dict, train_mode=False)
+        pred_v = data_seq_to_patch(model.patch_size, pred_seq, Ff, Hh, Ww, batch_size=1)
 
-        # map delta_i to original frames [4i, 4i+1, 4i+2, 4i+3]
-        st = i * 4
-        ed = st + 4
-        if st >= len(original_frames):
-            break
-        group_frames = original_frames[st:min(ed, len(original_frames))]
-        for j, bg in enumerate(group_frames):
-            h_img, w_img = bg.shape[0], bg.shape[1]
-            hm_up = F.interpolate(hm[None, None], size=(h_img, w_img), mode="bilinear", align_corners=False)[0, 0].cpu()
-            hm_rgb = _to_color_heatmap(hm_up)
-            ov = _overlay(bg, hm_rgb, args.alpha)
+        # frame 维度上的 delta（按用户定义：delta[0]=v0-0，delta[t]=v_t-v_{t-1}）
+        delta_target = torch.zeros_like(target_v)
+        delta_pred = torch.zeros_like(pred_v)
+        delta_target[:, :, 0] = target_v[:, :, 0]
+        delta_pred[:, :, 0] = pred_v[:, :, 0]
+        delta_target[:, :, 1:] = target_v[:, :, 1:] - target_v[:, :, :-1]
+        delta_pred[:, :, 1:] = pred_v[:, :, 1:] - pred_v[:, :, :-1]
 
-            frame_global = st + j
-            from PIL import Image
-            Image.fromarray(ov.numpy()).save(out_dir / f"delta_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
-            Image.fromarray(hm_rgb.numpy()).save(out_dir / f"weight_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
+        z_dim = int(getattr(vae.config, "z_dim", len(vae.config.latents_mean)))
 
-    print(f"Done. Saved overlays/weights to {out_dir}")
+        if latents.shape[1] != z_dim and latents.shape[1] % z_dim != 0:
+            raise ValueError(
+                f"Latent channels {latents.shape[1]} incompatible with VAE z_dim={z_dim}. "
+                "Please check dataset latent format or base VAE path."
+            )
+
+        # original composed frames (o1...): used as final visualization background
+        original_frames = _build_original_frame_sequence(cur_dset, cur_meta, num_latent_frames=Ff, cfg=cfg)
+        if len(original_frames) < Ff * 4:
+            print(f"[warn] original frames only {len(original_frames)} < required {Ff*4}, will visualize available frames only")
+
+        # out_dir = Path(args.out_dir)
+        # out_dir.mkdir(parents=True, exist_ok=True)
+
+        base_dir = Path(args.out_dir)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        out_dir = base_dir / f"{timestamp}_sample_{si}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        delta_used = delta_pred if args.delta_source == "pred" else delta_target
+        max_pairs = min(args.max_frame_pairs, delta_used.shape[2])
+        
+        saved_delta_sources = set() 
+        for i in range(max_pairs):
+            # [C,H,W] -> [H,W]
+            hm = _merge_group_heatmaps(delta_used[0, :, i], z_dim=z_dim)
+
+            def _norm(x):
+                x = x - x.min()
+                return x / (x.max() + 1e-6)
+
+            hm = _norm(hm)
+
+            # map delta_i to original frames [4i, 4i+1, 4i+2, 4i+3]
+            st = i * 4
+            ed = st + 4
+            if st >= len(original_frames):
+                break
+            # group_frames = original_frames[st:min(ed, len(original_frames))]
+            # for j, bg in enumerate(group_frames):
+            #     h_img, w_img = bg.shape[0], bg.shape[1]
+            #     hm_up = F.interpolate(hm[None, None], size=(h_img, w_img), mode="bilinear", align_corners=False)[0, 0].cpu()
+            #     hm_rgb = _to_color_heatmap(hm_up)
+            #     ov = _overlay(bg, hm_rgb, args.alpha)
+
+            #     frame_global = st + j
+            #     from PIL import Image
+            #     Image.fromarray(ov.numpy()).save(out_dir / f"delta_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
+            #     Image.fromarray(hm_rgb.numpy()).save(out_dir / f"weight_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
+            group_frames = original_frames[st:min(ed, len(original_frames))]
+            for j, bg in enumerate(group_frames):
+                h_img, w_img = bg.shape[0], bg.shape[1]
+                hm_up = F.interpolate(hm[None, None], size=(h_img, w_img), mode="bilinear", align_corners=False)[0, 0].cpu()
+                hm_rgb = _to_color_heatmap(hm_up)
+                ov = _overlay(bg, hm_rgb, args.alpha)
+
+                frame_global = st + j
+
+                # 只保存每个 delta_source 的第一张
+                if i not in saved_delta_sources:
+                    from PIL import Image
+                    Image.fromarray(ov.numpy()).save(out_dir / f"delta_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
+                    # Image.fromarray(hm_rgb.numpy()).save(out_dir / f"weight_{args.delta_source}_latent_{i+1:03d}_frame_{frame_global+1:04d}.png")
+
+                    saved_delta_sources.add(i)
+
+        print(f"Done. Saved overlays/weights to {out_dir}")
 
 
 if __name__ == "__main__":
