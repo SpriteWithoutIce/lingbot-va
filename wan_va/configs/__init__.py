@@ -5,6 +5,8 @@ from .va_franka_i2va import va_franka_i2va_cfg
 from .va_robotwin_i2va import va_robotwin_i2va_cfg
 from .va_robotwin_train_cfg import va_robotwin_train_cfg
 from .va_robotwin_video_train_cfg import va_robotwin_video_train_cfg
+from .va_robotwin_action_expert_train_cfg import va_robotwin_action_expert_train_cfg
+from .va_robotwin_joint_train_cfg import va_robotwin_joint_train_cfg
 from .va_libero_spatial_cfg import va_libero_spatial_cfg
 from .va_libero_spatial_train_cfg import va_libero_spatial_train_cfg
 from .va_libero_all_train_cfg import va_libero_all_train_cfg
@@ -21,6 +23,8 @@ VA_CONFIGS = {
     'franka_i2av': va_franka_i2va_cfg,
     'robotwin_train': va_robotwin_train_cfg,
     'robotwin_video_train': va_robotwin_video_train_cfg,
+    'robotwin_action_expert_train': va_robotwin_action_expert_train_cfg,
+    'robotwin_joint_train': va_robotwin_joint_train_cfg,
     'libero_spatial': va_libero_spatial_cfg,
     'libero_spatial_train': va_libero_spatial_train_cfg,
     'libero_all_train': va_libero_all_train_cfg,

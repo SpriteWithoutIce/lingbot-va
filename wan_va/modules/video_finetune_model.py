@@ -3,12 +3,14 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
 
 from .model import (
+    FlexAttnFunc,
     WanRotaryPosEmbed,
     WanTimeTextImageEmbedding,
     WanTransformerBlock,
@@ -115,11 +117,116 @@ class WanVideoFinetuneTransformer3DModel(ModelMixin, ConfigMixin):
         temb, timestep_proj = self.condition_embedder(latent_time_steps, dtype=dtype)
         return temb, timestep_proj.unflatten(2, (6, -1))
 
+    @torch.no_grad()
+    def _init_video_only_mask(self, latent_shape, padded_length, window_size, device):
+        b, _, l_f, l_h, l_w = latent_shape
+        patch_h, patch_w = self.patch_size[1], self.patch_size[2]
+
+        latent_seq_id = (
+            torch.arange(b)[:, None, None, None]
+            .expand(-1, l_f // self.patch_size[0], l_h // patch_h, l_w // patch_w)
+            .flatten()
+        )
+        seq_ids = torch.cat([latent_seq_id, latent_seq_id], dim=0)
+
+        latent_frame_id = (
+            torch.arange(l_f)[None, :, None, None]
+            .expand(b, -1, l_h // patch_h, l_w // patch_w)[None]
+            .flatten()
+        )
+        frame_ids = torch.cat([latent_frame_id, latent_frame_id], dim=0)
+        noise_ids = torch.cat(
+            [torch.zeros_like(latent_frame_id), torch.ones_like(latent_frame_id)], dim=0
+        )
+
+        seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
+        frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
+        noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
+
+        mask_mod = FlexAttnFunc._get_mask_mod(
+            seq_ids.long().to(device),
+            frame_ids.long().to(device),
+            noise_ids.long().to(device),
+            window_size,
+        )
+        block_mask = FlexAttnFunc.compiled_create_block_mask(
+            mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
+        )
+        FlexAttnFunc.attention_mask = block_mask
+
+        text_seq_ids = torch.arange(b)[:, None].expand(-1, 512).flatten()
+        mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(
+            seq_ids.long().to(device), text_seq_ids.long().to(device)
+        )
+        block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
+            mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
+        )
+        FlexAttnFunc.cross_attention_mask = block_mask_cross
+
     def forward_train(self, input_dict):
         latent_dict = input_dict["latent_dict"]
-        latent_dict["noisy_latents"] = latent_dict["noisy_latents"].to(torch.bfloat16)
-        latent_dict["latent"] = latent_dict["latent"].to(torch.bfloat16)
-        return self.forward(latent_dict, train_mode=False)
+        noisy_latents = latent_dict["noisy_latents"].to(torch.bfloat16)
+        clean_latents = latent_dict.get("latent", noisy_latents).to(torch.bfloat16)
+        text_hidden_states = self.condition_embedder.text_embedder(latent_dict["text_emb"]).flatten(0, 1)[None]
+
+        b = noisy_latents.shape[0]
+        noisy_hidden_states = self._input_embed(noisy_latents).flatten(0, 1)[None]
+        clean_hidden_states = self._input_embed(clean_latents).flatten(0, 1)[None]
+        hidden_states = torch.cat([noisy_hidden_states, clean_hidden_states], dim=1)
+
+        latent_grid_id = latent_dict["grid_id"].permute(1, 0, 2).flatten(1)[None]
+        full_grid_id = torch.cat([latent_grid_id, latent_grid_id], dim=2)
+        rotary_emb = self.rope(full_grid_id)[:, :, None]
+
+        cond_timesteps = latent_dict.get("cond_timesteps", torch.zeros_like(latent_dict["timesteps"]))
+        latent_time_steps = torch.cat(
+            [latent_dict["timesteps"].flatten(0, 1), cond_timesteps.flatten(0, 1)], dim=0
+        )[None]
+        temb, timestep_proj = self._time_embed(
+            latent_time_steps,
+            noisy_latents,
+            hidden_states.dtype,
+        )
+
+        total_length = hidden_states.shape[1]
+        padded_length = (128 - total_length % 128) % 128
+        hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
+        rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
+        temb = F.pad(temb, (0, 0, 0, padded_length))
+        timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
+
+        split_list = [noisy_hidden_states.shape[1], clean_hidden_states.shape[1], padded_length]
+        self._init_video_only_mask(
+            latent_shape=noisy_latents.shape,
+            padded_length=padded_length,
+            window_size=int(input_dict.get("window_size", 64)),
+            device=hidden_states.device,
+        )
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                text_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                update_cache=False,
+            )
+
+        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
+        shift, scale = rearrange(temb_scale_shift_table, "b l n c -> b n l c").chunk(2, dim=1)
+        hidden_states = (
+            self.norm_out(hidden_states.float()) * (1.0 + scale.squeeze(1)) + shift.squeeze(1)
+        ).type_as(hidden_states)
+
+        noisy_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
+        noisy_hidden_states = self.proj_out(noisy_hidden_states)
+        noisy_hidden_states = rearrange(
+            noisy_hidden_states,
+            "1 (b l) (n c) -> b (l n) c",
+            n=math.prod(self.patch_size),
+            b=b,
+        )
+        return noisy_hidden_states
 
     def forward(
         self,

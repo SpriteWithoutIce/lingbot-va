@@ -27,6 +27,7 @@ from modules.utils import (
     load_transformer,
     load_vae,
 )
+from modules.action_expert_model import FlowMatchingActionExpert
 from utils import (
     FlowMatchScheduler,
     data_seq_to_patch,
@@ -56,6 +57,7 @@ class VA_Server:
             extra_one_step=True)
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
+        self.mip_t_star = float(getattr(job_config, "mip_t_star", 0.9))
 
         
 
@@ -79,6 +81,8 @@ class VA_Server:
             transformer_path,
             torch_dtype=self.dtype,
             torch_device=self.device,
+            model_name=getattr(job_config, "transformer_model_name", "wan_va"),
+            transformer_source=getattr(job_config, "transformer_source", "lingbot_va"),
         )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -107,6 +111,30 @@ class VA_Server:
                 torch_device=self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+
+        self.action_expert = None
+        self.use_action_expert = False
+        action_expert_ckpt_path = getattr(job_config, "action_expert_checkpoint_path", None)
+        if action_expert_ckpt_path and os.path.exists(action_expert_ckpt_path):
+            logger.info(f"Loading action expert checkpoint: {action_expert_ckpt_path}")
+            self.action_expert = FlowMatchingActionExpert(
+                action_dim=self.job_config.action_dim,
+                state_dim=getattr(self.job_config, "robot_state_dim", 16),
+                velocity_dim=getattr(self.job_config, "action_expert_velocity_dim", 48),
+                hidden_dim=getattr(self.job_config, "action_expert_hidden_dim", 768),
+                num_heads=getattr(self.job_config, "action_expert_num_heads", 12),
+                num_layers=getattr(self.job_config, "action_expert_num_layers", 8),
+                dropout=getattr(self.job_config, "action_expert_dropout", 0.1),
+                ffn_mult=getattr(self.job_config, "action_expert_ffn_mult", 4),
+                timestep_dim=getattr(self.job_config, "action_expert_timestep_dim", 256),
+            ).to(self.device, dtype=self.dtype)
+            state_dict = torch.load(action_expert_ckpt_path, map_location="cpu", weights_only=False)
+            self.action_expert.load_state_dict(state_dict, strict=True)
+            self.action_expert.eval()
+            self.use_action_expert = True
+            logger.info("Action expert enabled for action inference.")
+        else:
+            logger.info("No action expert checkpoint found, fallback to transformer action branch.")
 
     def _get_t5_prompt_embeds(
         self,
@@ -254,6 +282,113 @@ class VA_Server:
             raise NotImplementedError
         action = action.squeeze(0).detach().cpu().numpy()
         return action[self.job_config.used_action_channel_ids]
+
+    def _extract_robot_state_vec(self, obs):
+        state_raw = None
+        if isinstance(obs, dict):
+            if "state" in obs:
+                state_raw = obs["state"]
+            elif "observation.state" in obs:
+                state_raw = obs["observation.state"]
+        if state_raw is None:
+            dim = int(getattr(self.job_config, "robot_state_dim", 16))
+            return torch.zeros(dim, dtype=self.dtype, device=self.device)
+
+        state_np = np.asarray(state_raw, dtype=np.float32)
+        if state_np.ndim == 0:
+            state_np = state_np.reshape(1)
+        if state_np.ndim > 1:
+            state_np = state_np.reshape(-1)
+
+        target_dim = int(getattr(self.job_config, "robot_state_dim", 16))
+        if state_np.shape[0] < target_dim:
+            state_np = np.pad(state_np, (0, target_dim - state_np.shape[0]), mode="constant", constant_values=0.0)
+        elif state_np.shape[0] > target_dim:
+            state_np = state_np[:target_dim]
+        return torch.from_numpy(state_np).to(self.device, dtype=self.dtype)
+
+    @torch.no_grad()
+    def _predict_video_velocity_condition(self, latents, frame_st_id=0):
+        frame_chunk_size = latents.shape[2]
+        input_dict = self._prepare_latent_input(
+            latent_model_input=latents,
+            action_model_input=None,
+            latent_t=0.0,
+            frame_st_id=frame_st_id,
+        )
+        latent_input = self._repeat_input_for_cfg(input_dict["latent_res_lst"])
+        video_vel_seq = self.transformer(
+            latent_input,
+            update_cache=0,
+            cache_name=self.cache_name,
+            action_mode=False,
+        )
+        video_vel_patch = data_seq_to_patch(
+            self.job_config.patch_size,
+            video_vel_seq,
+            frame_chunk_size,
+            self.latent_height,
+            self.latent_width,
+            batch_size=2 if self.use_cfg else 1,
+        )
+        if self.use_cfg:
+            video_vel_patch = video_vel_patch[1:] + self.job_config.guidance_scale * (
+                video_vel_patch[:1] - video_vel_patch[1:]
+            )
+        else:
+            video_vel_patch = video_vel_patch[:1]
+        return video_vel_patch.mean(dim=(-1, -2))
+
+    @torch.no_grad()
+    def _infer_action_with_mip(self, obs, latents, frame_chunk_size, frame_st_id):
+        action_cond = torch.zeros(
+            [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
+            device=self.device,
+            dtype=self.dtype,
+        ) if frame_st_id == 0 else None
+        action_mask = self.action_mask.to(self.device)
+        velocity_cond = self._predict_video_velocity_condition(
+            latents, frame_st_id=frame_st_id
+        ).to(self.dtype)
+        state_vec = self._extract_robot_state_vec(obs)
+        robot_states = state_vec[None, None, None, :].repeat(
+            1, frame_chunk_size, self.action_per_frame, 1
+        )
+
+        # MIP inference step-0: pure noise input
+        noisy_step0 = torch.randn(
+            [1, self.job_config.action_dim, frame_chunk_size, self.action_per_frame, 1],
+            device=self.device,
+            dtype=self.dtype,
+        )
+        noisy_step0[:, ~action_mask] *= 0
+        t0 = torch.zeros(1, device=self.device, dtype=self.dtype)
+        pred_step0, _ = self.action_expert(
+            noisy_actions=noisy_step0,
+            timesteps=t0,
+            latent_velocity=velocity_cond,
+            robot_states=robot_states,
+            action_padding_mask=None,
+        )
+
+        pred_step0_cf = pred_step0.permute(0, 3, 1, 2).unsqueeze(-1)
+        # MIP inference step-1: 0.9 * step0 prediction + noise
+        noise_step1 = torch.randn_like(pred_step0_cf)
+        noisy_step1 = self.mip_t_star * pred_step0_cf + (1.0 - self.mip_t_star) * noise_step1
+        noisy_step1[:, ~action_mask] *= 0
+        t1 = torch.full((1,), self.mip_t_star, device=self.device, dtype=self.dtype)
+        pred_step1, _ = self.action_expert(
+            noisy_actions=noisy_step1,
+            timesteps=t1,
+            latent_velocity=velocity_cond,
+            robot_states=robot_states,
+            action_padding_mask=None,
+        )
+        actions = pred_step1.permute(0, 3, 1, 2).unsqueeze(-1)
+        if action_cond is not None:
+            actions[:, :, 0:1] = action_cond[:, :, 0:1]
+        actions[:, ~action_mask] *= 0
+        return actions
     
     def _repeat_input_for_cfg(self, input_dict):
         if self.use_cfg:
@@ -586,44 +721,52 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
-            for i, t in enumerate(tqdm(action_timesteps)):
-                last_step = i == len(action_timesteps) - 1
-                action_cond = torch.zeros(
-                    [
-                        1, self.job_config.action_dim, 1,
-                        self.action_per_frame, 1
-                    ],
-                    device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
+            if self.use_action_expert:
+                actions = self._infer_action_with_mip(
+                    obs=obs,
+                    latents=latents,
+                    frame_chunk_size=frame_chunk_size,
+                    frame_st_id=frame_st_id,
+                )
+            else:
+                for i, t in enumerate(tqdm(action_timesteps)):
+                    last_step = i == len(action_timesteps) - 1
+                    action_cond = torch.zeros(
+                        [
+                            1, self.job_config.action_dim, 1,
+                            self.action_per_frame, 1
+                        ],
+                        device=self.device,
+                        dtype=self.dtype) if frame_st_id == 0 else None
 
-                input_dict = self._prepare_latent_input(
-                    None,
-                    actions,
-                    t,
-                    t,
-                    None,
-                    action_cond,
-                    frame_st_id=frame_st_id)
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True)
+                    input_dict = self._prepare_latent_input(
+                        None,
+                        actions,
+                        t,
+                        t,
+                        None,
+                        action_cond,
+                        frame_st_id=frame_st_id)
+                    action_noise_pred = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=True)
 
-                if not last_step:
-                    action_noise_pred = rearrange(action_noise_pred,
-                                                  'b (f n) c -> b c f n 1',
-                                                  f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
-                    else:
-                        action_noise_pred = action_noise_pred[:1]
-                    actions = self.action_scheduler.step(action_noise_pred,
-                                                         t,
-                                                         actions,
-                                                         return_dict=False)
+                    if not last_step:
+                        action_noise_pred = rearrange(action_noise_pred,
+                                                      'b (f n) c -> b c f n 1',
+                                                      f=frame_chunk_size)
+                        if self.job_config.action_guidance_scale > 1:
+                            action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                        else:
+                            action_noise_pred = action_noise_pred[:1]
+                        actions = self.action_scheduler.step(action_noise_pred,
+                                                             t,
+                                                             actions,
+                                                             return_dict=False)
 
-                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+                    actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
 
@@ -710,6 +853,29 @@ class VA_Server:
         return (n / weights) * (numer / denom)
 
     def _compute_kv_cache(self, obs):
+        if self.use_action_expert:
+            self.transformer.clear_pred_cache(self.cache_name)
+            if self.exp_save_root:
+                save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+            latent_model_input = self._encode_obs(obs)
+            if self.frame_st_id == 0:
+                latent_model_input = torch.cat(
+                    [self.init_latent, latent_model_input],
+                    dim=2) if latent_model_input is not None else self.init_latent
+            input_dict = self._prepare_latent_input(
+                latent_model_input, None, frame_st_id=self.frame_st_id
+            )
+            with torch.no_grad():
+                self.transformer(
+                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                    update_cache=2,
+                    cache_name=self.cache_name,
+                    action_mode=False
+                )
+            torch.cuda.empty_cache()
+            self.frame_st_id += latent_model_input.shape[2]
+            return
+
         self.transformer.clear_pred_cache(self.cache_name)
         if self.exp_save_root:
             save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
@@ -822,6 +988,9 @@ def run(args):
     # 训练保存的 ckpt 仅含 transformer；指定后从 ckpt/transformer 加载，vae/tokenizer/text_encoder 仍用 base
     if getattr(args, "ckpt", None):
         config.transformer_checkpoint_path = os.path.join(args.ckpt, "transformer")
+        action_expert_ckpt = os.path.join(args.ckpt, "action_expert.pt")
+        if os.path.exists(action_expert_ckpt):
+            config.action_expert_checkpoint_path = action_expert_ckpt
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))

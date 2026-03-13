@@ -42,7 +42,7 @@ def construct_lerobot_multi_processor(config,
                                       ):
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    if len(repo_list) <= 1:
+    if len(repo_list) <= 1 or num_init_worker <= 1:
         datasets_out_lst = [construct_lerobot(repo_id, config) for repo_id in repo_list]
     else:
         construct_func = partial(
@@ -200,9 +200,19 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.used_video_keys = config.obs_cam_keys
         self.q01 = pad_to_dim(config.norm_stat['q01'], 30, pad_value=0.0)
         self.q99 = pad_to_dim(config.norm_stat['q99'], 30, pad_value=1.0)
+        state_candidates = ["observation.state", "state"]
+        self.state_key = None
+        for candidate in state_candidates:
+            if candidate in self.hf_dataset.column_names:
+                self.state_key = candidate
+                break
+        self.has_state_column = self.state_key is not None
+        hf_columns = ["action"]
+        if self.has_state_column:
+            hf_columns.append(self.state_key)
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
-                columns=['action'],
+                columns=hf_columns,
                 output_all_columns=False
             )
         self.parse_meta()
@@ -374,6 +384,7 @@ class LatentLeRobotDataset(LeRobotDataset):
                                  h=latent_height, 
                                  w=latent_width)
             latent_lst.append(latent)
+            # print(f"{key} latent shape: {latent.shape}")
         if self.config.env_type == 'robotwin_tshape':
             wrist_latent = torch.cat(latent_lst[1:], dim=2)
             cat_latent = torch.cat([wrist_latent, latent_lst[0]], dim=1)
@@ -392,7 +403,7 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
-        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+        frame_stride = (latent_frame_ids[1] - latent_frame_ids[0]) // 4
         action = action[act_shift:]
         if torch.is_tensor(action):
             action = action.cpu().numpy()
@@ -404,8 +415,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         #     action = convert_action_to_quat(action)
             # action = np.concatenate([get_relative_pose(action[:, :7]), action[:, 7:8]], axis=1)
         # pad 4 actions
-        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
-        latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
+        # action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+        latent_frame_num = len(latent_frame_ids) - 1
+        # print(f"latent_frame_num: {latent_frame_num}, frame_stride: {frame_stride}, action shape: {action.shape}")
         required_action_num = latent_frame_num * frame_stride * 4
         action = action[:required_action_num]
         action_mask = np.ones_like(action, dtype='bool')
@@ -442,6 +454,41 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
+    def _state_post_process(self, local_start_frame, latent_frame_ids, robot_state):
+        act_shift = int(latent_frame_ids[0] - local_start_frame)
+        frame_stride = (latent_frame_ids[1] - latent_frame_ids[0]) // 4
+        if torch.is_tensor(robot_state):
+            robot_state = robot_state.cpu().numpy()
+        robot_state = np.asarray(robot_state, dtype=np.float32)
+        if robot_state.ndim == 1:
+            robot_state = robot_state[:, None]
+
+        robot_state = robot_state[act_shift:]
+        robot_state = np.repeat(robot_state, repeats=4, axis=0)
+        robot_state = np.pad(
+            robot_state,
+            pad_width=((frame_stride * 4, 0), (0, 0)),
+            mode='constant',
+            constant_values=0.0,
+        )
+
+        latent_frame_num = len(latent_frame_ids) - 1
+        required_state_num = latent_frame_num * frame_stride * 4
+        robot_state = robot_state[:required_state_num]
+        assert robot_state.shape[0] == required_state_num
+
+        target_state_dim = int(getattr(self.config, "robot_state_dim", 30))
+        cur_dim = robot_state.shape[1]
+        if cur_dim < target_state_dim:
+            robot_state = np.pad(robot_state, ((0, 0), (0, target_state_dim - cur_dim)), mode='constant', constant_values=0.0)
+        elif cur_dim > target_state_dim:
+            robot_state = robot_state[:, :target_state_dim]
+
+        state_mask = np.ones_like(robot_state, dtype=bool)
+        robot_state = rearrange(robot_state, "(f n) c -> f n c", f=latent_frame_num)
+        state_mask = rearrange(state_mask, "(f n) c -> f n c", f=latent_frame_num)
+        return torch.from_numpy(robot_state).float(), torch.from_numpy(state_mask).bool()
+
     def __getitem__(self, idx) -> dict:
         idx = idx % len(self.new_metas)
         cur_meta = self.new_metas[idx]
@@ -461,6 +508,14 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        if self.has_state_column:
+            robot_state_src = ori_data_dict[self.state_key]
+        else:
+            # Fallback when state is absent in the dataset schema.
+            robot_state_src = ori_data_dict['action']
+        out_dict['robot_states'], out_dict['robot_states_mask'] = self._state_post_process(
+            local_start_frame, latent_frame_ids, robot_state_src
+        )
         
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         out_dict['episode_index'] = episode_index
