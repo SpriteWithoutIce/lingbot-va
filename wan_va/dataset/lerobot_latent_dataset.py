@@ -202,7 +202,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.q99 = pad_to_dim(config.norm_stat['q99'], 30, pad_value=1.0)
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
-                columns=['action'],
+                columns=['action', 'observation.state'],
                 output_all_columns=False
             )
         self.parse_meta()
@@ -380,6 +380,49 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
+    def _state_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, state):
+        del local_end_frame
+        act_shift = int(latent_frame_ids[0] - local_start_frame)
+        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+        state = state[act_shift:]
+        if torch.is_tensor(state):
+            state = state.cpu().numpy()
+
+        state = np.pad(
+            state,
+            pad_width=((frame_stride * 4, 0), (0, 0)),
+            mode='constant',
+            constant_values=0,
+        )
+        latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
+        required_state_num = latent_frame_num * frame_stride * 4
+        state = state[:required_state_num]
+        state_mask = np.ones_like(state, dtype='bool')
+        assert state.shape[0] == required_state_num
+
+        # state is 16-d in RobotWin meta; align/pad to action_dim(30) index space
+        state_padded = np.pad(
+            state,
+            ((0, 0), (0, max(0, self.config.action_dim - state.shape[1]))),
+            mode='constant',
+            constant_values=0,
+        )[:, :self.config.action_dim]
+        state_mask_padded = np.pad(
+            state_mask,
+            ((0, 0), (0, max(0, self.config.action_dim - state.shape[1]))),
+            mode='constant',
+            constant_values=0,
+        )[:, :self.config.action_dim]
+
+        state_aligned = state_padded[:, self.config.inverse_used_action_channel_ids]
+        state_mask_aligned = state_mask_padded[:, self.config.inverse_used_action_channel_ids]
+        state_aligned = (state_aligned - self.q01) / (self.q99 - self.q01 + 1e-6) * 2. - 1.
+        state_aligned = np.clip(state_aligned, -1.0, 1.0)
+        state_aligned = rearrange(state_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        state_mask_aligned = rearrange(state_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        state_aligned *= state_mask_aligned
+        return torch.from_numpy(state_aligned).float(), torch.from_numpy(state_mask_aligned).bool()
+
     def __getitem__(self, idx) -> dict:
         idx = idx % len(self.new_metas)
         cur_meta = self.new_metas[idx]
@@ -398,7 +441,12 @@ class LatentLeRobotDataset(LeRobotDataset):
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(
+            local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action']
+        )
+        out_dict['states'], out_dict['states_mask'] = self._state_post_process(
+            local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['observation.state']
+        )
         
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         out_dict['episode_index'] = episode_index

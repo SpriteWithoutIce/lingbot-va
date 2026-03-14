@@ -41,7 +41,8 @@ from utils import (
 class VA_Server:
 
     def __init__(self, job_config):
-        self.cache_name = 'pos'
+        self.video_cache_name = 'video_pos'
+        self.action_cache_name = 'action_pos'
         self.job_config = job_config
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
@@ -50,12 +51,7 @@ class VA_Server:
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
                                             extra_one_step=True)
-        self.action_scheduler = FlowMatchScheduler(
-            shift=self.job_config.action_snr_shift,
-            sigma_min=0.0,
-            extra_one_step=True)
         self.scheduler.set_timesteps(1000, training=True)
-        self.action_scheduler.set_timesteps(1000, training=True)
 
         
 
@@ -404,7 +400,8 @@ class VA_Server:
         self.frame_st_id = 0
         self.init_latent = None
         #### clean vae and transformer cache
-        self.transformer.clear_cache(self.cache_name)
+        self.transformer.clear_cache(self.video_cache_name)
+        self.transformer.clear_cache(self.action_cache_name)
         self.streaming_vae.clear_cache()
 
         self.action_per_frame = self.job_config.action_per_frame
@@ -430,14 +427,24 @@ class VA_Server:
                                       patch_size[0] * patch_size[1] *
                                       patch_size[2])
         action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
-        self.transformer.create_empty_cache(self.cache_name,
-                                            self.job_config.attn_window,
-                                            latent_token_per_chunk,
-                                            action_token_per_chunk,
-                                            dtype=self.dtype,
-                                            device=self.device,
-                                            batch_size = 2 if self.use_cfg else 1
-                                            )
+        self.transformer.create_empty_cache(
+            self.video_cache_name,
+            self.job_config.attn_window,
+            latent_token_per_chunk=latent_token_per_chunk,
+            action_token_per_chunk=0,
+            dtype=self.dtype,
+            device=self.device,
+            batch_size=2 if self.use_cfg else 1,
+        )
+        self.transformer.create_empty_cache(
+            self.action_cache_name,
+            self.job_config.attn_window,
+            latent_token_per_chunk=0,
+            action_token_per_chunk=action_token_per_chunk,
+            dtype=self.dtype,
+            device=self.device,
+            batch_size=2 if self.use_cfg else 1,
+        )
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
         self.action_mask[self.job_config.used_action_channel_ids] = True
@@ -484,7 +491,7 @@ class VA_Server:
                               self.latent_width,
                               device=self.device,
                               dtype=self.dtype)
-        actions = torch.randn(1,
+        actions = torch.zeros(1,
                               self.job_config.action_dim,
                               frame_chunk_size,
                               self.action_per_frame,
@@ -493,25 +500,15 @@ class VA_Server:
                               dtype=self.dtype)
 
         video_inference_step = self.job_config.num_inference_steps
-        action_inference_step = self.job_config.action_num_inference_steps
         video_step = self.job_config.video_exec_step
 
         self.scheduler.set_timesteps(video_inference_step)
-        self.action_scheduler.set_timesteps(action_inference_step)
         timesteps = self.scheduler.timesteps
-        action_timesteps = self.action_scheduler.timesteps
 
         timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
 
         if video_step != -1:
             timesteps = timesteps[:video_step]
-
-        action_timesteps = F.pad(
-            action_timesteps,
-            (0,
-             1),  # pad 1 element at the end (right side) of the last dimension
-            mode='constant',
-            value=0)
 
         semantic_probe = bool(obs.get("semantic_probe", False))
         semantic_payload = {
@@ -522,6 +519,8 @@ class VA_Server:
             "frame_hw": None,
             "layer_ids": [],
         } if semantic_probe else None
+        action_expert = self._get_action_expert()
+        final_video_velocity = None
 
         with (
                 torch.no_grad(),
@@ -543,7 +542,7 @@ class VA_Server:
                 transformer_out = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                     update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
+                    cache_name=self.video_cache_name,
                     action_mode=False,
                     return_layer_hidden_states=semantic_probe,
                     return_layer_cross_attn=semantic_probe)
@@ -570,15 +569,17 @@ class VA_Server:
                 else:
                     video_noise_pred = transformer_out
 
+                video_noise_pred = data_seq_to_patch(
+                    self.job_config.patch_size, video_noise_pred,
+                    frame_chunk_size, self.latent_height,
+                    self.latent_width, batch_size=2 if self.use_cfg else 1)
+                if self.job_config.guidance_scale > 1:
+                    video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                else:
+                    video_noise_pred = video_noise_pred[:1]
+                final_video_velocity = video_noise_pred
+
                 if not last_step or video_step != -1:
-                    video_noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, video_noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
-                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
-                    else:
-                        video_noise_pred = video_noise_pred[:1]
                     latents = self.scheduler.step(video_noise_pred,
                                                   t,
                                                   latents,
@@ -586,44 +587,34 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
-            for i, t in enumerate(tqdm(action_timesteps)):
-                last_step = i == len(action_timesteps) - 1
-                action_cond = torch.zeros(
-                    [
-                        1, self.job_config.action_dim, 1,
-                        self.action_per_frame, 1
-                    ],
-                    device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
+            if final_video_velocity is None:
+                final_video_velocity = torch.zeros_like(latents)
+            delta_v = torch.zeros_like(final_video_velocity)
+            delta_v[:, :, 1:] = final_video_velocity[:, :, 1:] - final_video_velocity[:, :, :-1]
 
-                input_dict = self._prepare_latent_input(
-                    None,
-                    actions,
-                    t,
-                    t,
-                    None,
-                    action_cond,
-                    frame_st_id=frame_st_id)
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True)
+            state_cond = self.preprocess_action(obs['state']).to(self.device).to(self.dtype)
+            if state_cond.shape[2] < frame_chunk_size:
+                state_cond = F.pad(state_cond, (0, 0, 0, 0, 0, frame_chunk_size - state_cond.shape[2]))
+            elif state_cond.shape[2] > frame_chunk_size:
+                state_cond = state_cond[:, :, :frame_chunk_size]
 
-                if not last_step:
-                    action_noise_pred = rearrange(action_noise_pred,
-                                                  'b (f n) c -> b c f n 1',
-                                                  f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
-                    else:
-                        action_noise_pred = action_noise_pred[:1]
-                    actions = self.action_scheduler.step(action_noise_pred,
-                                                         t,
-                                                         actions,
-                                                         return_dict=False)
+            t_star = float(getattr(self.job_config, "mip_t_star", 0.9))
+            t0 = torch.zeros((1, frame_chunk_size), dtype=torch.float32, device=self.device)
+            tt = torch.full((1, frame_chunk_size), t_star, dtype=torch.float32, device=self.device)
 
-                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+            step1_pred, _ = action_expert(
+                noisy_actions=torch.zeros_like(actions),
+                timesteps=t0,
+                delta_v=delta_v.detach(),
+                states=state_cond,
+            )
+            step2_pred, _ = action_expert(
+                noisy_actions=(t_star * step1_pred).to(self.dtype),
+                timesteps=tt,
+                delta_v=delta_v.detach(),
+                states=state_cond,
+            )
+            actions = step2_pred
 
         actions[:, ~self.action_mask] *= 0
 
@@ -709,8 +700,15 @@ class VA_Server:
         n = h * w
         return (n / weights) * (numer / denom)
 
+    def _get_action_expert(self):
+        if hasattr(self.transformer, "action_expert"):
+            return self.transformer.action_expert
+        if hasattr(self.transformer, "module") and hasattr(self.transformer.module, "action_expert"):
+            return self.transformer.module.action_expert
+        raise AttributeError("Cannot find action_expert on transformer/FSDP wrapper.")
+
     def _compute_kv_cache(self, obs):
-        self.transformer.clear_pred_cache(self.cache_name)
+        self.transformer.clear_pred_cache(self.video_cache_name)
         if self.exp_save_root:
             save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
@@ -719,13 +717,9 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
-        action_model_input = action_model_input.to(latent_model_input)
-        logger.info(
-            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
-        )
+        logger.info(f"get KV cache obs: {latent_model_input.shape}")
         input_dict = self._prepare_latent_input(latent_model_input,
-                                                action_model_input,
+                                                None,
                                                 frame_st_id=self.frame_st_id)
 
         with (
@@ -733,13 +727,8 @@ class VA_Server:
         ):
             self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                              update_cache=2,
-                             cache_name=self.cache_name,
+                             cache_name=self.video_cache_name,
                              action_mode=False)
-
-            self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=True)
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
         print(latent_model_input.shape)
@@ -802,7 +791,8 @@ class VA_Server:
             pred_action_lst.append(actions)
         pred_latent = torch.cat(pred_latent_lst, dim=2)
         pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
-        self.transformer.clear_cache(self.cache_name)
+        self.transformer.clear_cache(self.video_cache_name)
+        self.transformer.clear_cache(self.action_cache_name)
         self.streaming_vae.clear_cache()
         if self.streaming_vae_half:
             self.streaming_vae_half.clear_cache()

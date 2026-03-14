@@ -26,6 +26,10 @@ va_robotwin_cfg.action_guidance_scale = 0.05
 va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
+va_robotwin_cfg.mip_t_star = 0.9
+va_robotwin_cfg.state_gate_window = 3
+va_robotwin_cfg.state_gate_gamma = 2.0
+va_robotwin_cfg.state_grad_lambda = 0.5
 
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0

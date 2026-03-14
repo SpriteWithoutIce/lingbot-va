@@ -51,7 +51,26 @@ def load_transformer(
         transformer_path,
         torch_dtype=torch_dtype,
         attn_mode=attn_mode,
+        low_cpu_mem_usage=True,
     )
+
+    # For newly added modules (e.g. action_expert) missing in checkpoint,
+    # diffusers may leave parameters on meta tensors under low_cpu_mem_usage.
+    # Materialize and initialize only those new-module params.
+    meta_param_names = [name for name, p in model.named_parameters() if p.is_meta]
+    if meta_param_names:
+        non_action_meta = [n for n in meta_param_names if not n.startswith("action_expert.")]
+        if non_action_meta:
+            raise RuntimeError(
+                "Unexpected non-action_expert meta parameters found: "
+                + ", ".join(non_action_meta[:8])
+            )
+        if hasattr(model, "action_expert"):
+            model.action_expert.to_empty(device=torch.device("cpu"))
+            for module in model.action_expert.modules():
+                if hasattr(module, "reset_parameters"):
+                    module.reset_parameters()
+
     return model.to(torch_device)
 
 

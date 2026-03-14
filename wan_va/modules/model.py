@@ -16,6 +16,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
 from typing import Callable, ClassVar
+from .action_expert import MIPActionExpert
 from torch.nn.attention.flex_attention import (
     _mask_mod_signature,
     BlockMask,
@@ -630,6 +631,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  in_channels=48,
                  out_channels=48,
                  action_dim=30,
+                 state_dim=30,
                  text_dim=4096,
                  freq_dim=256,
                  ffn_dim=14336,
@@ -638,7 +640,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  eps=1e-06,
                  rope_max_seq_len=1024,
                  pos_embed_seq_len=None,
-                 attn_mode="torch"):
+                 attn_mode="torch",
+                 action_expert_hidden_dim=1024,
+                 action_expert_num_heads=8,
+                 state_gate_window=3,
+                 state_gate_gamma=2.0,
+                 state_grad_lambda=0.5):
         r"""
         TODO
         """
@@ -677,6 +684,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.action_proj_out = nn.Linear(inner_dim, action_dim)
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
+        self.action_expert = MIPActionExpert(
+            action_dim=action_dim,
+            state_dim=state_dim,
+            delta_v_dim=out_channels,
+            hidden_dim=action_expert_hidden_dim,
+            num_heads=action_expert_num_heads,
+            gate_window=state_gate_window,
+            gate_gamma=state_gate_gamma,
+            state_grad_lambda=state_grad_lambda,
+        )
 
     def clear_cache(self, cache_name):
         for block in self.blocks:
@@ -687,10 +704,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             block.attn1.clear_pred_cache(cache_name)
 
     def create_empty_cache(self, cache_name, attn_window,
-                           latent_token_per_chunk, action_token_per_chunk,
-                           device, dtype, batch_size):
-        total_tolen = (attn_window // 2) * latent_token_per_chunk + (
-            attn_window // 2) * action_token_per_chunk
+                           latent_token_per_chunk=0, action_token_per_chunk=0,
+                           device=None, dtype=None, batch_size=1):
+        latent_token_per_chunk = int(latent_token_per_chunk or 0)
+        action_token_per_chunk = int(action_token_per_chunk or 0)
+        total_tolen = (attn_window // 2) * (
+            latent_token_per_chunk + action_token_per_chunk)
+        if total_tolen <= 0:
+            raise ValueError(
+                f"Cache '{cache_name}' needs positive token size, got "
+                f"latent={latent_token_per_chunk}, action={action_token_per_chunk}, "
+                f"attn_window={attn_window}."
+            )
         for block in self.blocks:
             block.attn1.init_kv_cache(cache_name, total_tolen,
                                       self.num_attention_heads,

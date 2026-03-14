@@ -111,10 +111,32 @@ class Trainer:
         )
         self.transformer.train()
         self.transformer.requires_grad_(True)
+        self.action_expert_learning_rate = float(
+            getattr(config, "action_expert_learning_rate", config.learning_rate * 0.1)
+        )
+        self.freeze_dit_steps = int(getattr(config, "freeze_dit_steps", 0))
 
         # Optimizer
+        action_expert = self._get_action_expert()
+        action_expert_param_ids = {id(p) for p in action_expert.parameters()}
+        action_expert_params = []
+        backbone_params = []
+        for p in self.transformer.parameters():
+            if not p.requires_grad:
+                continue
+            if id(p) in action_expert_param_ids:
+                action_expert_params.append(p)
+            else:
+                backbone_params.append(p)
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": config.learning_rate})
+        if action_expert_params:
+            param_groups.append({"params": action_expert_params, "lr": self.action_expert_learning_rate})
+        if not param_groups:
+            raise RuntimeError("No trainable parameters found for optimizer.")
         self.optimizer = torch.optim.AdamW(
-            [p for p in self.transformer.parameters() if p.requires_grad],
+            param_groups,
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
             eps=1e-8,
@@ -125,6 +147,7 @@ class Trainer:
 
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+        self._apply_freeze_policy()
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
@@ -146,8 +169,7 @@ class Trainer:
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
-        self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
-        self.train_scheduler_action.set_timesteps(1000, training=True)
+        self.mip_t_star = float(getattr(self.config, "mip_t_star", 0.9))
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.save_dir = Path(config.save_root) / f"checkpoints_{timestamp}"
@@ -226,36 +248,38 @@ class Trainer:
             grid_id=latent_grid_id,
         )
 
+    def _text_mask(self, text_emb):
+        return (text_emb.abs().sum(dim=-1) > 0)
+
+    def _get_action_expert(self):
+        if hasattr(self.transformer, "action_expert"):
+            return self.transformer.action_expert
+        if hasattr(self.transformer, "module") and hasattr(self.transformer.module, "action_expert"):
+            return self.transformer.module.action_expert
+        raise AttributeError("Cannot find action_expert on transformer/FSDP wrapper.")
+
+    def _apply_freeze_policy(self):
+        freeze_dit = self.step < self.freeze_dit_steps
+        action_expert = self._get_action_expert()
+        action_expert_param_ids = {id(p) for p in action_expert.parameters()}
+        for p in self.transformer.parameters():
+            if id(p) in action_expert_param_ids:
+                p.requires_grad_(True)
+            else:
+                p.requires_grad_(not freeze_dit)
+
     @torch.no_grad()
-    def _prepare_input_dict(self, batch_dict):
-        """Prepare input dict following infer code pattern from wan_va_server.py."""
-        # Generate grid_id following infer code (no batch dimension yet)
-        # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
-        latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
+    def _prepare_video_input(self, batch_dict):
+        video_dict = self._add_noise(
+            latent=batch_dict['latents'],
+            train_scheduler=self.train_scheduler_latent,
+            action_mask=None,
             action_mode=False,
-            noisy_cond_prob=0.5)
-        
-        action_dict = self._add_noise(
-            latent=batch_dict['actions'], 
-            train_scheduler=self.train_scheduler_action, 
-            action_mask=batch_dict['actions_mask'], 
-            action_mode=True,
-            noisy_cond_prob=0.0)
-
-        latent_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['actions_mask'] = batch_dict['actions_mask']
-
-        input_dict = {
-            'latent_dict': latent_dict,
-            'action_dict': action_dict,
-            'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
-        }
-        return input_dict
+            noisy_cond_prob=0.5,
+        )
+        video_dict["text_emb"] = batch_dict["text_emb"]
+        video_dict["encoder_attention_mask"] = self._text_mask(batch_dict["text_emb"])
+        return video_dict
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
@@ -263,54 +287,106 @@ class Trainer:
             input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
-    def compute_loss(self,
-        input_dict,
-        pred
-    ):
-        latent_pred, action_pred = pred
-        action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
-        latent_pred = data_seq_to_patch(
-                        self.patch_size, latent_pred,
-                        input_dict['latent_dict']['targets'].shape[-3], input_dict['latent_dict']['targets'].shape[-2],
-                        input_dict['latent_dict']['targets'].shape[-1], batch_size=latent_pred.shape[0])
-        Bn, Fn = input_dict['latent_dict']['timesteps'].shape
-        latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
-        action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+    def _compute_video_loss(self, video_dict, video_pred_seq):
+        video_pred = data_seq_to_patch(
+            self.patch_size, video_pred_seq,
+            video_dict['targets'].shape[-3], video_dict['targets'].shape[-2],
+            video_dict['targets'].shape[-1], batch_size=video_pred_seq.shape[0]
+        )
+        Bn, Fn = video_dict['timesteps'].shape
+        weight = self.train_scheduler_latent.training_weight(
+            video_dict['timesteps'].flatten()
+        ).reshape(Bn, Fn)
+        loss = F.mse_loss(
+            video_pred.float(),
+            video_dict['targets'].float().detach(),
+            reduction='none',
+        )
+        loss = loss * weight[:, None, :, None, None]
+        loss = loss.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
+        loss = (loss.sum(dim=1) / (torch.ones_like(loss).sum(dim=1) + 1e-6)).mean()
+        return loss, video_pred
 
-        # Frame-wise video loss calculation
-        latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
-        latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and compute mask per frame
-        latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+    def _compute_action_mip_loss(self, batch_dict, video_velocity):
+        actions = batch_dict["actions"].to(self.dtype)
+        actions_mask = batch_dict["actions_mask"].to(self.dtype)
+        states = batch_dict["states"].to(self.dtype)
+        states_mask = batch_dict["states_mask"].to(self.dtype)
+        B, _, F, N, _ = actions.shape
+        block_size = int(self.config.frame_chunk_size)
+        num_blocks = max((F + block_size - 1) // block_size, 1)
+        # Delta-v from video velocity (latent branch), no grad back to DiT.
+        delta_v = torch.zeros_like(video_velocity)
+        delta_v[:, :, 1:] = video_velocity[:, :, 1:] - video_velocity[:, :, :-1]
+        delta_v = delta_v.detach()
 
-        # Frame-wise action loss calculation
-        action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
-        mask = input_dict['action_dict']['actions_mask'].float()
-        raw_mse_mean = (action_loss * mask).sum() / (mask.sum() + 1e-6)
-        
-        action_loss = action_loss * action_loss_weight[:, None, :, None, None]
-        action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and normalize by mask per frame
-        action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
-        action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        action_loss = actions.new_tensor(0.0)
+        raw_mse = actions.new_tensor(0.0)
+        sigma_mean = actions.new_tensor(0.0)
+        action_expert = self._get_action_expert()
+        for block_id in range(num_blocks):
+            start = block_id * block_size
+            end = min((block_id + 1) * block_size, F)
+            cur_f = end - start
+            if cur_f <= 0:
+                continue
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, raw_mse_mean.detach()
+            hist_action = actions[:, :, :start] * actions_mask[:, :, :start]
+            hist_state = states[:, :, :start] * states_mask[:, :, :start]
+            hist_delta = delta_v[:, :, :start]
+
+            gt_action = actions[:, :, start:end] * actions_mask[:, :, start:end]
+            gt_state = states[:, :, start:end] * states_mask[:, :, start:end]
+            mask = actions_mask[:, :, start:end]
+
+            t0 = torch.zeros((B, end), dtype=torch.float32, device=self.device)
+            cur_zero = torch.zeros_like(gt_action)
+            step1_actions = torch.cat([hist_action, cur_zero], dim=2)
+            step1_states = torch.cat([hist_state, gt_state], dim=2)
+            step1_delta = torch.cat([hist_delta, delta_v[:, :, start:end]], dim=2)
+            pred_step1_all, sigma = action_expert(
+                noisy_actions=step1_actions,
+                timesteps=t0,
+                delta_v=step1_delta,
+                states=step1_states,
+            )
+            pred_step1 = pred_step1_all[:, :, start:end]
+
+            z = torch.randn_like(gt_action, dtype=self.dtype)
+            noisy_step2 = (self.mip_t_star * pred_step1.detach() + (1.0 - self.mip_t_star) * z) * mask
+            t_star = torch.zeros((B, end), dtype=torch.float32, device=self.device)
+            t_star[:, start:end] = self.mip_t_star
+            step2_actions = torch.cat([hist_action, noisy_step2], dim=2)
+            pred_step2_all, _ = action_expert(
+                noisy_actions=step2_actions,
+                timesteps=t_star,
+                delta_v=step1_delta,
+                states=step1_states,
+            )
+            pred_step2 = pred_step2_all[:, :, start:end]
+
+            denom = mask.sum().float().clamp_min(1.0)
+            loss_step1 = (((pred_step1.float() - gt_action.float()) ** 2) * mask).sum() / denom
+            loss_step2 = (((pred_step2.float() - gt_action.float()) ** 2) * mask).sum() / denom
+            action_loss = action_loss + (loss_step1 + loss_step2)
+            raw_mse = raw_mse + loss_step2.detach()
+            sigma_mean = sigma_mean + sigma[:, start:end].mean().detach()
+
+        action_loss = action_loss / float(num_blocks)
+        raw_mse = raw_mse / float(num_blocks)
+        sigma_mean = sigma_mean / float(num_blocks)
+        return action_loss, raw_mse, sigma_mean
+
+    def _velocity_delta_metric(self, video_velocity):
+        if video_velocity.shape[2] <= 1:
+            return video_velocity.new_tensor(0.0)
+        dv = video_velocity[:, :, 1:] - video_velocity[:, :, :-1]
+        return dv.abs().mean().detach()
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
         batch = self.convert_input_format(batch)
-        input_dict = self._prepare_input_dict(batch)
+        video_dict = self._prepare_video_input(batch)
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
         
@@ -319,13 +395,42 @@ class Trainer:
         else:
             self.transformer.set_requires_gradient_sync(True)
 
-        output = self.transformer(input_dict, train_mode=True)
-        latent_loss, action_loss, raw_mse = self.compute_loss(input_dict, output)
+        video_pred_seq = self.transformer(video_dict, action_mode=False)
+        latent_loss, video_velocity = self._compute_video_loss(video_dict, video_pred_seq)
+        action_loss, raw_mse, sigma_mean = self._compute_action_mip_loss(batch, video_velocity)
+        vel_delta = self._velocity_delta_metric(video_velocity)
+
+        if (not torch.isfinite(latent_loss)) or (not torch.isfinite(action_loss)):
+            logger.warning(
+                f"Non-finite loss detected at step={self.step}: "
+                f"latent_loss={latent_loss.detach().float().cpu().item()}, "
+                f"action_loss={action_loss.detach().float().cpu().item()}. "
+                "Skip this micro-batch."
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            zero = torch.zeros((), device=self.device, dtype=torch.float32)
+            return {
+                'latent_loss': zero,
+                'action_loss': zero,
+                'raw_mse': raw_mse.detach().float(),
+                'vel_delta': vel_delta.detach().float(),
+                'sigma_mean': sigma_mean.detach().float(),
+                'should_log': False,
+            }
+
+        latent_loss = latent_loss / self.gradient_accumulation_steps
+        action_loss = action_loss / self.gradient_accumulation_steps
         loss = latent_loss + action_loss
 
         loss.backward()
 
-        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach(), 'raw_mse': raw_mse.detach()}
+        losses = {
+            'latent_loss': latent_loss.detach(),
+            'action_loss': action_loss.detach(),
+            'raw_mse': raw_mse.detach(),
+            'vel_delta': vel_delta,
+            'sigma_mean': sigma_mean,
+        }
         
         # Only update weights after accumulating gradients
         if should_sync:
@@ -450,9 +555,12 @@ class Trainer:
         accumulated_latent_losses = []
         accumulated_action_losses = []
         accumulated_raw_mse_losses = []
+        accumulated_vel_delta = []
+        accumulated_sigma_mean = []
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
+            self._apply_freeze_policy()
             # Get next batch (handles epoch reset automatically)
             batch = self._get_next_batch()
             
@@ -462,6 +570,8 @@ class Trainer:
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
             accumulated_raw_mse_losses.append(losses['raw_mse'])
+            accumulated_vel_delta.append(losses['vel_delta'])
+            accumulated_sigma_mean.append(losses['sigma_mean'])
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
@@ -475,10 +585,14 @@ class Trainer:
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
                 raw_mse_show = dist_mean(torch.stack(accumulated_raw_mse_losses).mean()).detach().cpu().item()
+                vel_delta_show = dist_mean(torch.stack(accumulated_vel_delta).mean()).detach().cpu().item()
+                sigma_mean_show = dist_mean(torch.stack(accumulated_sigma_mean).mean()).detach().cpu().item()
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
                 accumulated_raw_mse_losses = []
+                accumulated_vel_delta = []
+                accumulated_sigma_mean = []
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -503,6 +617,8 @@ class Trainer:
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'loss_metrics/global_avg_raw_mse': raw_mse_show,
+                            'loss_metrics/global_avg_video_velocity_delta': vel_delta_show,
+                            'loss_metrics/global_avg_state_gate_sigma': sigma_mean_show,
                             'grad_norm': total_norm.item(),
                             'lr': lr,
                         }, step=self.step)
@@ -531,23 +647,9 @@ class Trainer:
     
     @torch.no_grad()
     def run_open_loop_eval(self, eval_batches):
-        """从训练数据取若干 batch，每个 batch 随机采样多个 4-chunk 窗口做开环测试。
-        每次推理只用 4 个 latent 帧（chunk_size=4）及其对应 action，与实际推理对齐：
-          - action frame 0 置零作为条件帧（timestep=0）
-          - 每步后重置 frame 0 = 0，并应用 action_mask
-          - 直接迭代 scheduler.timesteps（extra_one_step 保证最后一步 sigma_=0）
-          - 最终结果取 noisy_actions（scheduler.step 累积结果）
-        """
+        """MIP 开环评估：每个 block 两次前向，t=0 与 t=t*。"""
         self.transformer.eval()
-
-        eval_action_scheduler = FlowMatchScheduler(
-            shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
-        num_steps = getattr(self.config, 'eval_action_num_inference_steps', 10)
-        eval_action_scheduler.set_timesteps(num_steps)
-        action_timesteps = eval_action_scheduler.timesteps
-
-        # 每次推理窗口大小（latent 帧数），对应 4 chunk；每个 batch 采样的窗口数
-        infer_chunk_size = 4
+        infer_chunk_size = int(self.config.frame_chunk_size)
         num_windows = getattr(self.config, 'eval_num_windows', 4)
 
         patch_f, patch_h, patch_w = self.patch_size
@@ -559,20 +661,21 @@ class Trainer:
             batch = self.convert_input_format(batch)
             latent_gt   = batch['latents']       # (B, C, LF, H, W)
             action_gt   = batch['actions']       # (B, CA, FA, NA, 1)
+            state_gt    = batch['states']        # (B, CS, FS, NA, 1)
             text_emb    = batch['text_emb']
             action_mask = batch['actions_mask']  # (B, CA, FA, NA, 1) bool
+            state_mask  = batch['states_mask']   # (B, CS, FS, NA, 1) bool
 
+            action_expert = self._get_action_expert()
             B, C, LF, H, W = latent_gt.shape
             _, CA, FA, NA, _ = action_gt.shape
 
             if LF < infer_chunk_size:
                 continue
 
-            # 在 [0, LF - infer_chunk_size] 随机采样多个窗口起点
             max_start = LF - infer_chunk_size
             starts = torch.randint(0, max_start + 1, (num_windows,)).tolist()
 
-            # grid_id 对于固定窗口大小只需计算一次
             latent_grid_id = get_mesh_id(
                 infer_chunk_size // patch_f, H // patch_h, W // patch_w,
                 t=0, f_w=1, f_shift=0, action=False
@@ -585,60 +688,51 @@ class Trainer:
             for start in starts:
                 end = start + infer_chunk_size
 
-                # 截取窗口
-                lat_win  = latent_gt[:, :, start:end, :, :]    # (B, C, 4, H, W)
-                act_win  = action_gt[:, :, start:end, :, :]    # (B, CA, 4, NA, 1)
-                mask_win = action_mask[:, :, start:end, :, :]  # (B, CA, 4, NA, 1)
+                lat_win  = latent_gt[:, :, start:end, :, :]
+                act_win  = action_gt[:, :, start:end, :, :]
+                mask_win = action_mask[:, :, start:end, :, :].to(self.dtype)
 
-                # GT latent 作为干净条件（timestep=0）
-                latent_dict = dict(
-                    timesteps=torch.zeros(B, infer_chunk_size, device=self.device),
-                    cond_timesteps=torch.zeros(B, infer_chunk_size, device=self.device),
-                    noisy_latents=lat_win.to(self.dtype),
-                    latent=lat_win.to(self.dtype),
-                    text_emb=text_emb,
-                    grid_id=latent_grid_id,
+                _ = self.transformer({
+                    "noisy_latents": lat_win.to(self.dtype),
+                    "timesteps": torch.zeros(B, infer_chunk_size, device=self.device),
+                    "grid_id": latent_grid_id,
+                    "text_emb": text_emb,
+                    "encoder_attention_mask": self._text_mask(text_emb),
+                }, action_mode=False)
+                video_velocity = data_seq_to_patch(
+                    self.patch_size,
+                    _,
+                    infer_chunk_size,
+                    H,
+                    W,
+                    batch_size=B,
                 )
+                delta_v = torch.zeros_like(video_velocity)
+                delta_v[:, :, 1:] = video_velocity[:, :, 1:] - video_velocity[:, :, :-1]
 
-                # action 从纯噪声出发；frame 0 = 条件帧（置零）
-                noisy_actions = torch.randn_like(act_win, dtype=self.dtype)
-                noisy_actions[:, :, 0:1] = 0.0
-                noisy_actions = noisy_actions * mask_win.float()
+                step1_input = {
+                    "noisy_actions": torch.zeros_like(act_win, dtype=self.dtype),
+                    "timesteps": torch.zeros(B, infer_chunk_size, dtype=torch.float32, device=self.device),
+                    "delta_v": delta_v.detach(),
+                    "states": (state_gt[:, :, start:end].to(self.dtype) * state_mask[:, :, start:end].to(self.dtype)),
+                }
+                pred0, _ = action_expert(**step1_input)
 
-                for t in action_timesteps:
-                    ts = torch.full((B, infer_chunk_size), t.item(), device=self.device)
-                    ts[:, 0] = 0.0
+                step2_input = {
+                    "noisy_actions": (self.mip_t_star * pred0 * mask_win).to(self.dtype),
+                    "timesteps": torch.full(
+                        (B, infer_chunk_size),
+                        self.mip_t_star,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    "delta_v": delta_v.detach(),
+                    "states": (state_gt[:, :, start:end].to(self.dtype) * state_mask[:, :, start:end].to(self.dtype)),
+                }
+                pred, _ = action_expert(**step2_input)
 
-                    action_dict = dict(
-                        timesteps=ts,
-                        cond_timesteps=torch.zeros(B, infer_chunk_size, device=self.device),
-                        noisy_latents=noisy_actions,
-                        latent=torch.zeros_like(noisy_actions),
-                        text_emb=text_emb,
-                        actions_mask=mask_win,
-                        grid_id=action_grid_id,
-                    )
-                    input_dict = {
-                        'latent_dict': latent_dict,
-                        'action_dict': action_dict,
-                        'chunk_size': 1,
-                        'window_size': 64,
-                    }
-                    _, action_pred_raw = self.transformer(input_dict, train_mode=True)
-                    action_pred = rearrange(
-                        action_pred_raw, 'b (f n) c -> b c f n 1', f=infer_chunk_size)
-
-                    noisy_actions = eval_action_scheduler.step(
-                        action_pred, t, noisy_actions, return_dict=False)
-                    noisy_actions[:, :, 0:1] = 0.0
-                    noisy_actions = noisy_actions * mask_win.float()
-
-                # MSE 只算预测帧（frame 1 到末尾），跳过 frame 0（条件帧，始终置零，不是预测目标）
-                pred_frames = noisy_actions[:, :, 1:, :, :]
-                gt_frames   = act_win[:, :, 1:, :, :]
-                mask_frames = mask_win[:, :, 1:, :, :].float()
-                mse = F.mse_loss(pred_frames.float(), gt_frames.float(), reduction='none')
-                mse_val = (mse * mask_frames).sum() / (mask_frames.sum() + 1e-6)
+                mse = F.mse_loss(pred.float(), act_win.float(), reduction='none')
+                mse_val = (mse * mask_win).sum() / (mask_win.sum() + 1e-6)
                 total_mse += mse_val.item()
                 total_count += 1
 
