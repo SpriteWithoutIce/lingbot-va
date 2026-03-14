@@ -354,6 +354,9 @@ class VA_Server:
         robot_states = state_vec[None, None, None, :].repeat(
             1, frame_chunk_size, self.action_per_frame, 1
         )
+        clean_actions_prefix = self.action_clean_cache
+        clean_states_prefix = self.action_state_cache
+        clean_vel_prefix = self.action_vel_cache
 
         # MIP inference step-0: pure noise input
         noisy_step0 = torch.randn(
@@ -369,6 +372,11 @@ class VA_Server:
             latent_velocity=velocity_cond,
             robot_states=robot_states,
             action_padding_mask=None,
+            clean_actions=clean_actions_prefix,
+            clean_latent_velocity=clean_vel_prefix,
+            clean_robot_states=clean_states_prefix,
+            clean_padding_mask=None,
+            clean_is_prefix=True,
         )
 
         pred_step0_cf = pred_step0.permute(0, 3, 1, 2).unsqueeze(-1)
@@ -383,12 +391,43 @@ class VA_Server:
             latent_velocity=velocity_cond,
             robot_states=robot_states,
             action_padding_mask=None,
+            clean_actions=clean_actions_prefix,
+            clean_latent_velocity=clean_vel_prefix,
+            clean_robot_states=clean_states_prefix,
+            clean_padding_mask=None,
+            clean_is_prefix=True,
         )
         actions = pred_step1.permute(0, 3, 1, 2).unsqueeze(-1)
         if action_cond is not None:
             actions[:, :, 0:1] = action_cond[:, :, 0:1]
         actions[:, ~action_mask] *= 0
+        self._append_action_history_cache(actions, robot_states, velocity_cond)
         return actions
+
+    @torch.no_grad()
+    def _append_action_history_cache(self, actions_cf, robot_states, velocity_cond):
+        if actions_cf is None:
+            return
+        if self.action_clean_cache is None:
+            self.action_clean_cache = actions_cf.detach().clone()
+            self.action_state_cache = robot_states.detach().clone()
+            self.action_vel_cache = velocity_cond.detach().clone()
+        else:
+            self.action_clean_cache = torch.cat(
+                [self.action_clean_cache, actions_cf.detach()], dim=2
+            )
+            self.action_state_cache = torch.cat(
+                [self.action_state_cache, robot_states.detach()], dim=1
+            )
+            self.action_vel_cache = torch.cat(
+                [self.action_vel_cache, velocity_cond.detach()], dim=2
+            )
+
+        max_blocks = int(getattr(self.job_config, "max_action_context_blocks", 128))
+        if self.action_clean_cache.shape[2] > max_blocks:
+            self.action_clean_cache = self.action_clean_cache[:, :, -max_blocks:]
+            self.action_state_cache = self.action_state_cache[:, -max_blocks:]
+            self.action_vel_cache = self.action_vel_cache[:, :, -max_blocks:]
     
     def _repeat_input_for_cfg(self, input_dict):
         if self.use_cfg:
@@ -538,6 +577,9 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self.action_clean_cache = None
+        self.action_state_cache = None
+        self.action_vel_cache = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()

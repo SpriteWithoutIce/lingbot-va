@@ -238,6 +238,10 @@ class FlowMatchingActionExpert(nn.Module):
         robot_states,
         action_padding_mask=None,
         clean_actions=None,
+        clean_latent_velocity=None,
+        clean_robot_states=None,
+        clean_padding_mask=None,
+        clean_is_prefix=False,
     ):
         action_seq, (f, n) = self._flatten_actions(noisy_actions)
         state_seq = self._flatten_states(robot_states, target_f=f, target_n=n)
@@ -251,30 +255,84 @@ class FlowMatchingActionExpert(nn.Module):
         state_cond_noisy = self.state_cond_proj(state_seq)
 
         if clean_actions is not None:
-            clean_seq, _ = self._flatten_actions(clean_actions)
+            clean_seq, (f_clean, n_clean) = self._flatten_actions(clean_actions)
+            if n_clean != n:
+                raise ValueError(
+                    f"Clean/noisy block mismatch: clean n={n_clean} vs noisy n={n}"
+                )
             x_clean = self.noisy_action_proj(clean_seq)
             t_clean = torch.zeros_like(timesteps)
             x_clean = x_clean + self.time_embed(t_clean.unsqueeze(-1).to(x_clean.dtype))
-            x_clean = x_clean + self.action_pos_embed(pos_ids)[None]
+            pos_ids_clean = torch.arange(x_clean.shape[1], device=x_clean.device)
+            x_clean = x_clean + self.action_pos_embed(pos_ids_clean)[None]
 
-            vel_cond_clean = self.vel_cond_proj(vel_cond)
-            state_cond_clean = self.state_cond_proj(state_seq)
+            if clean_latent_velocity is None:
+                clean_latent_velocity = latent_velocity
+            if clean_robot_states is None:
+                clean_robot_states = robot_states
+            clean_state_seq = self._flatten_states(
+                clean_robot_states, target_f=f_clean, target_n=n_clean
+            )
+            clean_vel_cond, clean_vel_mag = self._build_velocity_condition(
+                clean_latent_velocity, target_f=f_clean, target_n=n_clean
+            )
+            vel_cond_clean = self.vel_cond_proj(clean_vel_cond)
+            state_cond_clean = self.state_cond_proj(clean_state_seq)
 
             x = torch.cat([x_noisy, x_clean], dim=1)
             vel_cond_full = torch.cat([vel_cond_noisy, vel_cond_clean], dim=1)
             state_cond_full = torch.cat([state_cond_noisy, state_cond_clean], dim=1)
-            vel_mag_full = torch.cat([vel_mag, vel_mag], dim=1)
+            vel_mag_full = torch.cat([vel_mag, clean_vel_mag], dim=1)
             if action_padding_mask is not None:
-                query_padding_mask = torch.cat(
-                    [action_padding_mask, action_padding_mask], dim=1
+                noisy_pad = action_padding_mask
+            else:
+                noisy_pad = None
+            if clean_padding_mask is not None:
+                clean_pad = clean_padding_mask
+            elif noisy_pad is not None and noisy_pad.shape[1] == x_clean.shape[1]:
+                clean_pad = noisy_pad
+            else:
+                clean_pad = torch.zeros(
+                    (x.shape[0], x_clean.shape[1]),
+                    device=x.device,
+                    dtype=torch.bool,
                 )
+
+            if noisy_pad is not None:
+                query_padding_mask = torch.cat([noisy_pad, clean_pad], dim=1)
                 condition_padding_mask = query_padding_mask
             else:
                 query_padding_mask = None
                 condition_padding_mask = None
-            causal_attn_mask = self._build_dual_stream_block_mask(
-                seq_len=x.shape[1], block_size=n, device=x.device
-            )
+
+            if clean_is_prefix or x_clean.shape[1] != x_noisy.shape[1]:
+                l_noisy = x_noisy.shape[1]
+                l_clean = x_clean.shape[1]
+                idx_noisy = torch.arange(l_noisy, device=x.device)
+                idx_clean = torch.arange(l_clean, device=x.device)
+                noisy_block = idx_noisy // n
+                clean_block = idx_clean // n
+                clean_blocks = max(1, l_clean // n)
+
+                allow = torch.zeros(
+                    (l_noisy + l_clean, l_noisy + l_clean),
+                    device=x.device,
+                    dtype=torch.bool,
+                )
+                # noisy queries: own noisy block + all previous clean blocks
+                allow_noisy_noisy = noisy_block[:, None] == noisy_block[None, :]
+                allow_noisy_clean = clean_block[None, :] < (
+                    noisy_block[:, None] + clean_blocks
+                )
+                allow[:l_noisy, :l_noisy] = allow_noisy_noisy
+                allow[:l_noisy, l_noisy:] = allow_noisy_clean
+                # clean queries: causal on clean stream
+                allow[l_noisy:, l_noisy:] = clean_block[:, None] >= clean_block[None, :]
+                causal_attn_mask = ~allow
+            else:
+                causal_attn_mask = self._build_dual_stream_block_mask(
+                    seq_len=x.shape[1], block_size=n, device=x.device
+                )
             noisy_len = x_noisy.shape[1]
         else:
             x = x_noisy
